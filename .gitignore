@@ -1,0 +1,10 @@
+__pycache__/
+*.egg-info/
+.pytest_cache/
+/build/
+/dist/
+# never commit data, crops, embeddings or alias files (names)
+/data/
+*.npz
+*.jpg
+aliases*.csv

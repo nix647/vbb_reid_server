@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vbb-reid-server"
+description = "Server-side re-verification of VBB person sightings (machine labels): offline evaluation, shadow runs, adjudication"
+readme = "README.md"
+requires-python = ">=3.10"
+dynamic = ["version"]
+classifiers = [
+    # No license is declared: this package must never reach a public index.
+    "Private :: Do Not Upload",
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+]
+# Deliberately independent of the board package `vbb-reid` (RKNN, --no-deps,
+# explicit package list). Nothing here imports `ReID.*`.
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8",
+]
+
+[project.optional-dependencies]
+# ONNX models (SCRFD, ArcFace/AdaFace exports, the board's own models via the gpu-ubun ONNX port).
+onnx = ["onnxruntime-gpu>=1.17"]
+onnx-cpu = ["onnxruntime>=1.17"]
+# Hugging Face vision encoders (SigLIP2, DINOv3) for the body/appearance path.
+hf = ["torch>=2.3", "transformers>=4.56", "pillow>=10"]
+dev = ["pytest>=7.0", "onnxruntime>=1.17"]
+
+[project.scripts]
+vbb-reid-server = "vbb_reid_server.cli:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "vbb_reid_server.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

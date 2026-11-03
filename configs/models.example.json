@@ -1,0 +1,22 @@
+{
+  "_comment": "One JSON per candidate model set. Copy it, fix the paths (absolute, or relative to the JSON file), then run `embed --models <file>`. face and body are each optional. Top-level keys other than name, face_detector, face and body are ignored.",
+  "name": "insightface-buffalo_l + siglip2-so400m",
+  "face_detector": {
+    "type": "scrfd",
+    "path": "/vmdata/vbb_eval/models/buffalo_l/det_10g.onnx",
+    "input_size": 640,
+    "score_thresh": 0.5
+  },
+  "face": {
+    "type": "onnx_face",
+    "path": "/vmdata/vbb_eval/models/buffalo_l/w600k_r50.onnx",
+    "color": "RGB",
+    "flip": true
+  },
+  "body": {
+    "type": "hf_vision",
+    "repo": "google/siglip2-so400m-patch14-384",
+    "pooling": "image_features",
+    "pad_square": true
+  }
+}
