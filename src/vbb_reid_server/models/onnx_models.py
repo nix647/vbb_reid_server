@@ -14,6 +14,11 @@ from .base import FaceDetection, file_model_id, l2n
 
 def _session(path: str | Path, providers: list[str] | None = None):
     import onnxruntime as ort  # optional dependency
+    if hasattr(ort, "preload_dlls"):  # ORT >= 1.21: use the CUDA/cuDNN libraries pip installed (e.g. with torch)
+        try:
+            ort.preload_dlls()
+        except Exception:
+            pass
     avail = ort.get_available_providers()
     wanted = providers or ["CUDAExecutionProvider", "CPUExecutionProvider"]
     use = [p for p in wanted if p in avail] or ["CPUExecutionProvider"]

@@ -34,6 +34,8 @@ LAN crops ────┘   (GPU)    (per model)        shadow ───► labe
 
 ## Runbook on gpu-ubun
 
+First time? Follow [`SETUP_gpu-ubun.md`](SETUP_gpu-ubun.md) step by step; this section is the short form.
+
 ```bash
 # 0. install (Python >= 3.10), into a venv
 python3 -m venv ~/venvs/vbbrs && . ~/venvs/vbbrs/bin/activate

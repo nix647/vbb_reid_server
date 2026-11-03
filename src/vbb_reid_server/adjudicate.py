@@ -12,6 +12,7 @@ import csv
 import html
 import json
 import random
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -209,9 +210,20 @@ def write_page(ex: Export, facility: str, sample_ids: list[str], path: Path, *, 
     path.write_text(page, encoding="utf-8")
 
 
+_MIXED_NOTE = re.compile(r"(2|two|二|两)\s*(people|persons|个?人)", re.IGNORECASE)
+
+
 def read_answers(path: Path) -> dict[str, str]:
+    """sighting_id -> answer. A note saying the crop shows two people turns the answer into
+    ``mixed`` whatever was clicked: a mixed track has no single truth, so it is excluded
+    from precision and used to check whether the machine flags it."""
+    out: dict[str, str] = {}
     with path.open(newline="", encoding="utf-8") as fh:
-        return {r["sighting_id"]: r["answer"] for r in csv.DictReader(fh) if r.get("answer")}
+        for r in csv.DictReader(fh):
+            if not r.get("answer"):
+                continue
+            out[r["sighting_id"]] = "mixed" if _MIXED_NOTE.search(r.get("note") or "") else r["answer"]
+    return out
 
 
 def score(ex: Export, answers: dict[str, str], labels: dict[str, MachineLabel] | dict[str, dict]) -> dict:
@@ -222,6 +234,7 @@ def score(ex: Export, answers: dict[str, str], labels: dict[str, MachineLabel] |
     per_day: dict[str, Tally] = {}
     by_stratum: dict[str, Tally] = {}
     cant = 0
+    mixed = mixed_flagged = 0
     for sid, ans in answers.items():
         s = by_id.get(sid)
         if s is None:
@@ -230,6 +243,12 @@ def score(ex: Export, answers: dict[str, str], labels: dict[str, MachineLabel] |
             cant += 1
             continue
         lab = labels.get(sid)
+        if ans == "mixed":
+            mixed += 1
+            rel = (lab.relation if isinstance(lab, MachineLabel) else lab.get("relation")) if lab else None
+            if rel == "mixed":
+                mixed_flagged += 1
+            continue
         state = (lab.state if isinstance(lab, MachineLabel) else lab["state"]) if lab else None
         key = (lab.person_key if isinstance(lab, MachineLabel) else lab["person_key"]) if lab else None
         if lab is None:
@@ -248,7 +267,7 @@ def score(ex: Export, answers: dict[str, str], labels: dict[str, MachineLabel] |
         if ans == "stranger":
             stranger_fa.add("wrong" if o == "wrong" else "abstain", sid)
     return {
-        "adjudicated": len(answers), "cant_tell": cant,
+        "adjudicated": len(answers), "cant_tell": cant, "mixed_noted": mixed, "mixed_flagged_by_machine": mixed_flagged,
         "precision": total.precision, "coverage": total.coverage, "correct": total.correct,
         "wrong": total.wrong, "flagged": total.flagged, "abstain": total.abstain,
         "precision_lo95_days": bootstrap_precision(per_day),

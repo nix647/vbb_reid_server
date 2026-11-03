@@ -8,6 +8,7 @@
   adjudicate-page    build the HTML page for a sample
   adjudicate-score   score a shadow run against exported answers
   prune              delete cached crops / embeddings older than N days
+  doctor             check GPU, ONNX Runtime providers, torch, and (optionally) load a model set
 """
 
 from __future__ import annotations
@@ -167,6 +168,44 @@ def cmd_prune(args) -> None:
     print(f"[prune] removed {n_c} cached crops, {n_e} embedding files older than {args.days} days")
 
 
+def cmd_doctor(args) -> None:
+    import platform
+    print(f"python {platform.python_version()} on {platform.platform()}")
+    try:
+        import onnxruntime as ort
+        if hasattr(ort, "preload_dlls"):
+            try:
+                ort.preload_dlls()
+            except Exception as e:
+                print(f"onnxruntime preload_dlls: {e}")
+        prov = ort.get_available_providers()
+        print(f"onnxruntime {ort.__version__}: providers {prov}")
+        if "CUDAExecutionProvider" not in prov:
+            print("  WARNING: no CUDAExecutionProvider - ONNX models will run on CPU (install onnxruntime-gpu)")
+    except ImportError:
+        print("onnxruntime: not installed (pip install -e '.[onnx]')")
+    try:
+        import torch
+        print(f"torch {torch.__version__}: cuda available={torch.cuda.is_available()}"
+              + (f", device {torch.cuda.get_device_name(0)}" if torch.cuda.is_available() else ""))
+    except ImportError:
+        print("torch: not installed (only needed for hf_vision body models: pip install -e '.[hf]')")
+    import os
+    print(f"HF_HOME={os.environ.get('HF_HOME', '(unset: models download to ~/.cache/huggingface)')}")
+    if args.models:
+        from .models import load_model_set
+        ms = load_model_set(args.models)
+        for part in ("face_detector", "face", "body"):
+            m = getattr(ms, part)
+            if m is None:
+                print(f"{part}: -")
+                continue
+            sess = getattr(m, "session", None)
+            where = sess.get_providers()[0] if sess is not None else getattr(m, "device", "?")
+            print(f"{part}: {m.model_id}  [{where}]")
+        print(f"face model id: {ms.face_id}\nbody model id: {ms.body_id}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="vbb-reid-server", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -245,6 +284,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--answers", required=True)
     sp.add_argument("--labels", nargs="+", required=True, help="shadow labels CSV(s)")
     sp.set_defaults(fn=cmd_adj_score)
+
+    sp = sub.add_parser("doctor")
+    sp.add_argument("--models", help="model config JSON to load as a test")
+    sp.set_defaults(fn=cmd_doctor)
 
     sp = sub.add_parser("prune")
     sp.add_argument("--emb")

@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 
 from helpers import FACE_ID, basis, near, write_export, write_face_cache
-from vbb_reid_server.adjudicate import sample, score, write_page
+from vbb_reid_server.adjudicate import read_answers, sample, score, write_page
 from vbb_reid_server.align import ARCFACE_DST, norm_crop, umeyama_similarity
 from vbb_reid_server.data import load_export
 from vbb_reid_server.decide import Thresholds
@@ -140,3 +140,10 @@ def test_norm_crop_of_an_aligned_face_is_identity():
     img = (RNG.random((112, 112, 3)) * 255).astype(np.uint8)
     out, residual = norm_crop(img, ARCFACE_DST.copy())
     assert residual < 1e-4 and np.abs(out.astype(int) - img.astype(int)).mean() < 1.0
+
+
+def test_two_people_note_makes_an_answer_mixed(tmp_path):
+    p = tmp_path / "answers.csv"
+    p.write_text('sighting_id,answer,note\n"a","H2","2 people, 昌爷 and 史迪仔"\n"b","cant_tell","2 people "\n'
+                 '"c","H1",""\n"d","H1","两个人"\n', encoding="utf-8")
+    assert read_answers(p) == {"a": "mixed", "b": "mixed", "c": "H1", "d": "mixed"}
