@@ -51,7 +51,7 @@ echo 'export HF_HOME=/vmdata/vbb_eval/hf' >> ~/.bashrc && export HF_HOME=/vmdata
 cd ~/vbb_reid_server && pytest -q && vbb-reid-server doctor
 ```
 
-Expected: `72 passed` (0.1.5); `onnxruntime ... providers [...'CUDAExecutionProvider'...]`;
+Expected: `74 passed` (0.1.6); `onnxruntime ... providers [...'CUDAExecutionProvider'...]`;
 `torch ... cuda available=True, device NVIDIA GeForce RTX 4070 Ti SUPER`.
 If `CUDAExecutionProvider` is missing, the CPU build may have been installed next to the GPU build
 (0.1.0/0.1.1's `dev` extra pulled it in; both provide the same module). Fix and check again:

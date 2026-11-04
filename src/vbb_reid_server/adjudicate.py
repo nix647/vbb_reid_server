@@ -31,8 +31,8 @@ def sample(ex: Export, facility: str, n: int, *, seed: int = 20261103, days: lis
 
     ``strata="board"``: equal share per stratum (board state x face/noface); a stratum with too few
     sightings passes its unused share to the others, so ``n`` is reached whenever the pool allows.
-    ``strata="none"``: uniform over the pool — the right design for "precision of what the machine
-    shows", where every machine output must be equally likely to be checked.
+    ``strata="none"``: a plain uniform draw over the pool (no spreading over days) — the design for
+    "precision of what the machine shows", where every machine output must be equally likely.
     Already human-labeled sightings and ``exclude`` are skipped; ``only`` restricts the pool (a
     TARGETED set describes that subset, not the population)."""
     rng = random.Random(seed)
@@ -40,7 +40,12 @@ def sample(ex: Export, facility: str, n: int, *, seed: int = 20261103, days: lis
     pool = [s for s in ex.sightings if s.facility_id == facility and s.human_state is None
             and s.image_url and s.sighting_id not in exclude and (days is None or s.day in days)
             and (only is None or s.sighting_id in only)]
-    key = (lambda s: "all") if strata == "none" else stratum
+    if strata == "none":
+        # A plain uniform draw: every sighting in the pool equally likely, no spreading over days
+        # (spreading over-samples quiet days and breaks the binomial bound's assumption).
+        pool.sort(key=lambda s: s.sighting_id)
+        return rng.sample(pool, min(n, len(pool)))
+    key = stratum
     by_stratum: dict[str, dict[str, list[Sighting]]] = defaultdict(lambda: defaultdict(list))
     for s in pool:
         by_stratum[key(s)][s.day].append(s)
@@ -252,7 +257,8 @@ def write_page(ex: Export, facility: str, sample_ids: list[str], path: Path, *, 
     path.write_text(page, encoding="utf-8")
 
 
-_MIXED_NOTE = re.compile(r"(2|two|二|两)\s*(people|persons|个?人)", re.IGNORECASE)
+# "2 people", "two persons", "2 ppl", "两个人" and typos like "2 peope" (owner note, 2026-11-05)
+_MIXED_NOTE = re.compile(r"(2|two|二|两)\s*(p[a-z]*p[a-z]*|pers[a-z]*|个?人)", re.IGNORECASE)
 
 
 def read_answers(path: Path) -> dict[str, str]:

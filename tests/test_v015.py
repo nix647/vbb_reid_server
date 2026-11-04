@@ -81,3 +81,25 @@ def test_eval_fix_pins_settings_when_choosing_the_operating_point(tmp_path):
 
 def test_helper_sighting_unused():
     assert sighting("x").sighting_id == "x"
+
+
+def test_unstratified_sample_is_proportional_to_a_skewed_pool(tmp_path):
+    """Owner finding 2026-11-05: --strata none still took sightings day by day, so a quiet day was
+    over-sampled (12 of 17 from 10-15 against an expected 3)."""
+    big = [{"sighting_id": f"b{i}", "facility_id": "3", "capture_ts": 1792900000000 + i * 1000,  # 2026-10-20
+            "image_url": f"https://cdn.invalid/b{i}.jpg"} for i in range(950)]
+    small = [{"sighting_id": f"q{i}", "facility_id": "3", "capture_ts": 1792900000000 + 3 * 86_400_000 + i * 1000,
+              "image_url": f"https://cdn.invalid/q{i}.jpg"} for i in range(50)]
+    write_export(tmp_path / "e", big + small, [("pA", "3", "visitor")], facilities=(("3", "2"),))
+    ex = load_export(tmp_path / "e")
+    got = sample(ex, "3", 200, strata="none", seed=1)
+    assert len(got) == 200
+    n_small = sum(s.sighting_id.startswith("q") for s in got)
+    assert n_small <= 25  # expected 10 (5 % of the pool); the day round-robin gave about 100
+
+
+def test_two_people_note_tolerates_typos():
+    from vbb_reid_server.adjudicate import _MIXED_NOTE
+    for note in ("2 peope, H1 on the left", "2 people", "two persons", "两个人", "2 ppl"):
+        assert _MIXED_NOTE.search(note), note
+    assert not _MIXED_NOTE.search("H2, partly hidden")
