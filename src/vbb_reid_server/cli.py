@@ -9,6 +9,7 @@
   adjudicate-score   score a shadow run against exported answers
   prune              delete cached crops / embeddings older than N days
   quality-report     which face-quality measures predict a reliable match (on human labels)
+  inspect            every measure, reference status and face score of given sightings
   doctor             check GPU, ONNX Runtime providers, torch, and (optionally) load a model set
 """
 
@@ -101,8 +102,8 @@ def cmd_embed(args) -> None:
 
 
 def cmd_eval(args) -> None:
-    from .evaluate import (curve_rows, evaluate_facility, gate_reasons, load_grid, operating_point,
-                           per_sighting_wrongs, summarize, write_curve, write_point)
+    from .evaluate import (curve_rows, evaluate_facility, load_grid, operating_point, per_sighting_wrongs,
+                           summarize, verdict, write_curve, write_point)
     ex = load_export(args.export, args.aliases)
     face_id = _ids_from_cache(args.emb, "face", args.face_model)
     body_id = _ids_from_cache(args.emb, "body", args.body_model)
@@ -125,9 +126,31 @@ def cmd_eval(args) -> None:
                         min_labeled=args.min_labeled, gate=args.gate)
             point = operating_point(rows, **gate)
             text = summarize(rows, point)
-            if point is None and rows:  # say why the best-covering rows failed
-                best = sorted(rows, key=lambda r: -(float(r["promote_coverage"] or 0)))[:3]
-                text += "\n" + "\n".join(f"  combo {r['combo']}: " + "; ".join(gate_reasons(r, **gate)) for r in best)
+            if point is None and rows:
+                verdicts = [(r, *verdict(r, **gate)) for r in rows]
+                insuff = [(r, why, nd) for r, v, why, nd in verdicts if v == "insufficient"]
+                if insuff:
+                    def cost(t):
+                        nd = t[2]
+                        lab = nd.get("labeled_promotions")
+                        loo = nd.get("loo_trials")
+                        need = max((lab or 10**9) - t[0]["promote_labeled"], (loo or 10**9) - int(t[0]["loo_n"] or 0), 0)
+                        return (need, -(float(t[0]["promote_coverage"] or 0)))
+                    r, why, nd = min(insuff, key=cost)
+                    text += (f"\nVERDICT: NOT ENOUGH EVIDENCE YET ({len(insuff)} of {len(rows)} rows; none contradicts the "
+                             f"targets). Closest: combo {r['combo']} (face_sim={r['face_sim']}, margin={r['face_margin']}, "
+                             f"face_q_min={r['face_q_min']}): {r['promote_labeled']} labeled promotions at precision "
+                             f"{r['promote_precision']}, coverage {r['promote_coverage']}, "
+                             f"loo {r['loo_false_accepts']}/{r['loo_n']}."
+                             f"\n  needs about {nd.get('labeled_promotions')} labeled promotions and "
+                             f"{nd.get('loo_trials')} leave-one-out trials at the current error rates "
+                             f"(None = the current rate itself is on the wrong side)\n  why: " + "; ".join(why))
+                else:
+                    text += "\nVERDICT: FAIL - every row is contradicted by the data:\n" + "\n".join(
+                        f"  combo {r['combo']}: " + "; ".join(why) for r, v, why, nd in
+                        sorted(verdicts, key=lambda t: -(float(t[0]["promote_coverage"] or 0)))[:3])
+            else:
+                text += "\nVERDICT: PASS"
             print(f"[eval] facility {fac} refs={mode}\n{text}")
             with (out / "report.md").open("a", encoding="utf-8") as fh:
                 fh.write(f"## {setup} · facility {fac} · refs {mode}\n\n```\n{text}\n```\n")
@@ -216,6 +239,21 @@ def cmd_quality_report(args) -> None:
     days = args.days.split(",") if args.days else ex.days(args.facility)
     report(ws, args.facility, days, bins=args.bins, far=args.far, max_faces=args.max_faces,
            out_csv=Path(args.out) if args.out else None)
+
+
+def cmd_inspect(args) -> None:
+    from .inspect_tool import inspect
+    ex = load_export(args.export, args.aliases)
+    face_id = _ids_from_cache(args.emb, "face", args.face_model)
+    th, quality, policy = _thresholds(args), QualityPolicy.from_file(args.quality), RefPolicy()
+    if args.point:
+        pt = json.loads(Path(args.point).read_text(encoding="utf-8"))
+        th = strict_replace(Thresholds(), pt["thresholds"], "Thresholds")
+        quality = strict_replace(QualityPolicy(), pt.get("quality", {}), "QualityPolicy")
+        policy = strict_replace(policy, pt.get("ref_policy", {}), "RefPolicy")
+    ws = Workspace(ex, args.emb, face_id, None, quality)
+    inspect(ws, args.facility, [x.strip() for x in args.sightings.split(",") if x.strip()], th, policy,
+            refs_mode=args.refs_mode)
 
 
 def cmd_doctor(args) -> None:
@@ -374,6 +412,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--max-faces", type=int, default=4000)
     sp.add_argument("--out", help="CSV of the table")
     sp.set_defaults(fn=cmd_quality_report)
+
+    sp = sub.add_parser("inspect", help="every measure, reference status and face score of given sightings")
+    common(sp)
+    sp.add_argument("--facility", required=True)
+    sp.add_argument("--sightings", required=True, help="comma list of sighting ids")
+    sp.add_argument("--face-model", required=True)
+    sp.add_argument("--point")
+    sp.add_argument("--thresholds")
+    sp.add_argument("--quality")
+    sp.add_argument("--refs-mode", choices=["temporal", "lodo"], default="temporal")
+    sp.set_defaults(fn=cmd_inspect)
 
     sp = sub.add_parser("doctor")
     sp.add_argument("--models", help="model config JSON to load as a test")

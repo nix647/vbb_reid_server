@@ -39,7 +39,7 @@ def slug(model_id: str) -> str:
     return hashlib.sha256(model_id.encode()).hexdigest()[:16]
 
 
-FACE_SCHEMA = 3  # 1 = 0.1.0 (stored qf); 2 = measures + .done file; 3 = measures + processed in the npz
+FACE_SCHEMA = 4  # 1 = 0.1.0 (stored qf); 2 = measures + .done; 3 = processed in the npz; 4 = + norm, n_faces, second face
 EMBED_FACE_MIN_PX = 8.0  # faces below this are not stored; the decision's face_min_px filters further
 
 
@@ -69,15 +69,19 @@ class FaceTable:
     residual: np.ndarray
     asym: np.ndarray
     yaw: np.ndarray
+    norm: np.ndarray  # raw feature norm before normalisation (nan: the model does not expose it)
+    n_faces: np.ndarray  # faces the detector found in the crop
+    second_ratio: np.ndarray  # height of the largest OTHER face / chosen face (0 when alone)
+    second_det: np.ndarray  # detector score of that other face (0 when alone)
     qf: np.ndarray  # derived on read from a QualityPolicy (never stored)
 
-    MEASURES = ("face_h", "det", "blur", "residual", "asym", "yaw")
+    MEASURES = ("face_h", "det", "blur", "residual", "asym", "yaw", "norm", "n_faces", "second_ratio", "second_det")
 
     @classmethod
     def empty(cls, dim: int = 0) -> "FaceTable":
         z = np.zeros(0)
         return cls(np.zeros(0, dtype=object), np.zeros(0, dtype=int), np.zeros(0, dtype=object),
-                   np.zeros((0, dim), dtype=np.float32), z, z, z, z, z, z, z)
+                   np.zeros((0, dim), dtype=np.float32), z, z, z, z, z, z, z, z, z, z, z)
 
     def __len__(self) -> int:
         return int(self.sighting_id.shape[0])
@@ -127,8 +131,8 @@ def load_face(root: Path, model_id: str, facility: str, day: str,
     if schema < FACE_SCHEMA:
         raise StaleCache(f"{f} has cache schema {schema} (current {FACE_SCHEMA}); `embed` re-embeds such a day "
                          f"automatically (crops are cached, so only the GPU work repeats)")
-    t = FaceTable(z["sighting_id"], z["crop_idx"], z["source"], z["vec"], z["face_h"], z["det"], z["blur"],
-                  z["residual"], z["asym"], z["yaw"], np.zeros(len(z["sighting_id"])))
+    t = FaceTable(z["sighting_id"], z["crop_idx"], z["source"], z["vec"],
+                  *(z[m] for m in FaceTable.MEASURES), np.zeros(len(z["sighting_id"])))
     return t.with_policy(policy or QualityPolicy())
 
 
@@ -236,22 +240,34 @@ def embed_day(sightings: list[Sighting], store: CropStore, models, emb_root: str
                 b_imgs.append(img)
             if need_face:
                 processed.add(key)
-                det = _best_face(models.face_detector.detect(img), img.shape[0])
+                dets = models.face_detector.detect(img)
+                det = _best_face(dets, img.shape[0])
                 if det is None or det.height < EMBED_FACE_MIN_PX:
                     continue
+                others = [d for d in dets if d is not det]
+                second = max(others, key=lambda d: d.height) if others else None
                 aligned, per_point = norm_crop_points(img, det.kps)
                 f_rows.append((s.sighting_id, ref.index, ref.source, det.height, det.score, blur_var(aligned),
-                               float(per_point.mean()), asymmetry(per_point), yaw_ratio(det.kps)))
+                               float(per_point.mean()), asymmetry(per_point), yaw_ratio(det.kps),
+                               len(dets), (second.height / det.height) if second else 0.0,
+                               second.score if second else 0.0))
                 f_imgs.append(aligned)
 
     if face_id:
-        vecs = models.face.embed(f_imgs) if f_imgs else np.zeros((0, old_face.vec.shape[1] if len(old_face) else 0), np.float32)
+        if not f_imgs:
+            vecs = np.zeros((0, old_face.vec.shape[1] if len(old_face) else 0), np.float32)
+            norms = np.zeros(0)
+        elif hasattr(models.face, "embed_with_norm"):
+            vecs, norms = models.face.embed_with_norm(f_imgs)
+        else:
+            vecs, norms = models.face.embed(f_imgs), np.full(len(f_imgs), np.nan)
         stats["faces"] = len(f_rows)
         col = lambda i: np.array([r[i] for r in f_rows], dtype=float)  # noqa: E731
         new = FaceTable(
             np.array([r[0] for r in f_rows], dtype=object), np.array([r[1] for r in f_rows], dtype=int),
             np.array([r[2] for r in f_rows], dtype=object), vecs.astype(np.float32),
-            col(3), col(4), col(5), col(6), col(7), col(8), np.zeros(len(f_rows)))
+            col(3), col(4), col(5), col(6), col(7), col(8), np.asarray(norms, dtype=float),
+            col(9), col(10), col(11), np.zeros(len(f_rows)))
         merged = _dedupe(_concat_face(old_face, new))
         fdir = root / "face" / slug(face_id) / facility
         _atomic_savez(fdir / f"{day}.npz", schema=np.int64(FACE_SCHEMA), sighting_id=merged.sighting_id,

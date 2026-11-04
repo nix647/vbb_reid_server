@@ -62,3 +62,12 @@ def test_shipped_configs_load_and_unknown_grid_keys_are_refused(tmp_path):
     bad.write_text(json.dumps({"face_simm": [0.3]}))
     with pytest.raises(ValueError):
         load_grid(str(bad))
+
+
+def test_inspect_prints_measures_scores_and_decision(tmp_path, capsys):
+    exp, emb = build(tmp_path)
+    main(["inspect", "--export", str(exp), "--aliases", str(tmp_path / "aliases.csv"), "--emb", str(emb),
+          "--facility", "3", "--face-model", FACE_ID, "--sightings", "tA0,unl0,nope"])
+    out = capsys.readouterr().out
+    assert "tA0" in out and "norm=" in out and "reference-usable=" in out and "face scores:" in out
+    assert "decision:" in out and "nope: not a facility 3 sighting" in out

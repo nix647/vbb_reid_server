@@ -261,6 +261,71 @@ def gate_reasons(row: dict, *, min_precision_lo: float, max_loo_fa: float, min_l
     return out
 
 
+def needed_trials(events: int, n: int, *, rate_bound: float, alpha: float = 0.025, upper: bool) -> int | None:
+    """Smallest total N (>= n) that would pass at the CURRENT event rate.
+
+    upper=False: ``events`` are successes and the binomial LOWER bound must reach ``rate_bound``
+    (precision). upper=True: ``events`` are failures and the UPPER bound must stay under it
+    (false accepts). None when the current rate itself is on the wrong side (more data at the
+    same rate never passes)."""
+    rate = events / n if n else (0.0 if upper else 1.0)
+    if (upper and rate >= rate_bound) or (not upper and rate <= rate_bound):
+        return None
+
+    def ok(N: int) -> bool:
+        k = round(rate * N)
+        return (cp_upper(k, N, alpha) or 1.0) <= rate_bound if upper else (cp_lower(k, N, alpha) or 0.0) >= rate_bound
+
+    lo, hi = max(n, 1), max(n, 1)
+    while not ok(hi):
+        hi *= 2
+        if hi > 10_000_000:
+            return None
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if ok(mid):
+            hi = mid
+        else:
+            lo = mid + 1
+    return hi
+
+
+def verdict(row: dict, *, min_precision_lo: float, max_loo_fa: float, min_labeled: int,
+            gate: str = "promote") -> tuple[str, list[str], dict]:
+    """``pass`` | ``fail`` | ``insufficient``.
+
+    - fail: the data show precision below the target (binomial UPPER bound under it) or false
+      accepts above the ceiling (LOWER bound over it) — more labels will not rescue this row.
+    - insufficient: nothing contradicts the targets, but the sample is too small to prove them.
+      ``needs`` says how many labeled promotions / leave-one-out trials would pass at the
+      current error rates. An insufficient row never enables display.
+    """
+    reasons = gate_reasons(row, min_precision_lo=min_precision_lo, max_loo_fa=max_loo_fa,
+                           min_labeled=min_labeled, gate=gate)
+    if not reasons:
+        return "pass", [], {}
+    labeled = row["promote_labeled"] if gate == "promote" else row["correct"] + row["wrong"]
+    if gate == "promote":
+        # promote correct = labeled * precision (exact integers are not in the row; recover them)
+        p = _num(row["promote_precision"])
+        correct = round(labeled * p) if p is not None else 0
+    else:
+        correct = row["correct"]
+    loo_n, loo_fa = int(row["loo_n"] or 0), int(row["loo_false_accepts"] or 0)
+    fail = []
+    if labeled and (cp_upper(correct, labeled) or 1.0) < min_precision_lo:
+        fail.append(f"precision demonstrably below {min_precision_lo} ({labeled - correct} wrong of {labeled})")
+    if loo_n and (cp_lower(loo_fa, loo_n) or 0.0) > max_loo_fa:
+        fail.append(f"false accepts demonstrably above {max_loo_fa} ({loo_fa} of {loo_n})")
+    if fail:
+        return "fail", fail + reasons, {}
+    needs = {}
+    n_prec = needed_trials(correct, labeled, rate_bound=min_precision_lo, upper=False)
+    needs["labeled_promotions"] = max(min_labeled, n_prec) if n_prec is not None else None
+    needs["loo_trials"] = needed_trials(loo_fa, loo_n, rate_bound=max_loo_fa, upper=True)
+    return "insufficient", reasons, needs
+
+
 def operating_point(rows: list[dict], min_precision_lo: float, max_loo_fa: float, *, min_labeled: int = 50,
                     gate: str = "promote") -> dict | None:
     """Highest coverage among rows that pass :func:`gate_reasons`. Note: the chosen row's own
@@ -307,5 +372,5 @@ def write_point(point: dict, path: Path, *, ref_policy, quality) -> None:
     }, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-__all__ = ["evaluate_facility", "curve_rows", "write_curve", "operating_point", "summarize",
+__all__ = ["verdict", "needed_trials", "evaluate_facility", "curve_rows", "write_curve", "operating_point", "summarize",
            "load_grid", "run_cutoff_ms", "per_sighting_wrongs", "gate_reasons", "write_point"]

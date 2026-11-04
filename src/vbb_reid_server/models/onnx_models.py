@@ -163,13 +163,19 @@ class OnnxFaceEmbedder:
     def _static(self) -> bool:
         return isinstance(self.session.get_inputs()[0].shape[0], int)
 
-    def embed(self, aligned_bgr: list[np.ndarray]) -> np.ndarray:
+    def embed_with_norm(self, aligned_bgr: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+        """Unit embeddings and the raw feature norm before normalisation (with flip: of the
+        mean of both passes). ArcFace/AdaFace-style models give a low norm to unrecognisable
+        inputs (hair, the back of a head), so the norm is stored as a quality measure."""
         if not aligned_bgr:
-            return np.zeros((0, 0), dtype=np.float32)
+            return np.zeros((0, 0), dtype=np.float32), np.zeros(0)
         e = self._run(aligned_bgr)
         if self.flip:
-            e = e + self._run([f[:, ::-1].copy() for f in aligned_bgr])
-        return l2n(e)
+            e = (e + self._run([f[:, ::-1].copy() for f in aligned_bgr])) / 2.0
+        return l2n(e), np.linalg.norm(e, axis=1).astype(np.float64)
+
+    def embed(self, aligned_bgr: list[np.ndarray]) -> np.ndarray:
+        return self.embed_with_norm(aligned_bgr)[0]
 
 
 class OnnxBodyEmbedder:

@@ -90,12 +90,13 @@ def write_face_cache(emb: Path, facility: str, day: str, rows: list[tuple[str, i
     ``qf`` exactly for face_h >= 40 (det = qf; blur, residual, asym, yaw neutral)."""
     d = _dir(emb, "face", FACE_ID, facility)
     n = len(rows)
-    np.savez(d / f"{day}.npz", schema=np.int64(3), processed=np.array([f"{r[0]}:cdn:{r[1]}" for r in rows], dtype=object),
+    np.savez(d / f"{day}.npz", schema=np.int64(4), processed=np.array([f"{r[0]}:cdn:{r[1]}" for r in rows], dtype=object),
              sighting_id=np.array([r[0] for r in rows], dtype=object), crop_idx=np.array([r[1] for r in rows]),
              source=np.array(["cdn"] * n, dtype=object),
              vec=np.stack([r[2] for r in rows]).astype(np.float32) if rows else np.zeros((0, D), np.float32),
              face_h=np.array([r[4] for r in rows], dtype=float), det=np.array([r[3] for r in rows], dtype=float),
-             blur=np.full(n, 1000.0), residual=np.zeros(n), asym=np.zeros(n), yaw=np.zeros(n))
+             blur=np.full(n, 1000.0), residual=np.zeros(n), asym=np.zeros(n), yaw=np.zeros(n),
+             norm=np.full(n, 20.0), n_faces=np.ones(n), second_ratio=np.zeros(n), second_det=np.zeros(n))
 
 
 def write_body_cache(emb: Path, facility: str, day: str, rows: list[tuple[str, int, np.ndarray]]) -> None:

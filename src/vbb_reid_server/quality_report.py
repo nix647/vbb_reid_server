@@ -31,12 +31,16 @@ MEASURES = {
     "residual": ("residual", np.maximum, False),
     "asym": ("asym", np.maximum, False),
     "abs_yaw": ("yaw", np.maximum, True),
+    "norm": ("norm", np.minimum, False),
+    "second_ratio": ("second_ratio", np.maximum, False),
+    "n_faces": ("n_faces", np.maximum, False),
 }
 
 
 def labeled_faces(ws: Workspace, facility: str, days: list[str], max_faces: int, seed: int = 0):
     ex = ws.export
-    keys, vecs, cols = [], [], {m: [] for m in ("qf", "det", "face_h", "blur", "residual", "asym", "yaw")}
+    keys, vecs, cols = [], [], {m: [] for m in ("qf", "det", "face_h", "blur", "residual", "asym", "yaw", "norm",
+                                                 "second_ratio", "n_faces")}
     label = {s.sighting_id: ex.key(s.human_person_id) for s in ex.sightings
              if s.facility_id == facility and s.human_state == "known" and s.day in days}
     for day in days:
@@ -78,6 +82,8 @@ def report(ws: Workspace, facility: str, days: list[str], *, bins: int = 5, far:
         x = cols[col]
         if absval:
             x = np.abs(x)
+        if not np.isfinite(x).all():  # e.g. norm from a model that does not expose it
+            continue
         pair_x = reduce(x[iu], x[ju])
         values = np.unique(pair_x)
         if len(values) <= bins:  # few distinct values: one bin per value

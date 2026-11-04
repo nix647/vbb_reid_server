@@ -224,6 +224,54 @@ def test_rows_without_a_processed_entry_are_not_duplicated(tmp_path):
     np.savez(d / f"{day}.npz", schema=np.int64(FACE_SCHEMA), processed=np.array([], dtype=object),
              sighting_id=np.array(["s0"], dtype=object), crop_idx=np.array([0]), source=np.array(["lan"], dtype=object),
              vec=np.ones((1, 4), np.float32) / 2, face_h=one * 60, det=one, blur=one * 500, residual=one * 0,
-             asym=one * 0, yaw=one * 0)  # a damaged cache: a row whose processed entry was lost
+             asym=one * 0, yaw=one * 0, norm=one * 20, n_faces=one, second_ratio=one * 0, second_det=one * 0)  # a damaged cache: a row whose processed entry was lost
     embed_day(ex.by_facility_day("3", day), CropStore(lan, None, fetch=False), ms_, emb, "3", day, log=lambda *_: None)
     assert len(load_face(emb, ms_.face_id, "3", day)) == 1
+
+
+# --- 2026-11-04 owner review: two-person crops and non-faces --------------------------------
+
+def test_a_crop_with_a_second_sizeable_face_is_flagged_mixed():
+    A, B = basis(0), basis(1)
+    refs = {"A": np.stack([near(A, 0.05, RNG) for _ in range(5)]), "B": np.stack([near(B, 0.05, RNG) for _ in range(5)])}
+    probe = {"p": [(0, near(B, 0.05, RNG), 0.9, 180.0, 20.0, 51 / 180, 0.84)]}  # a2edee5618ff's shape
+    th_off = Thresholds(face_sim=0.5, face_margin=0.1, body_enabled=False)
+    th_on = Thresholds(face_sim=0.5, face_margin=0.1, body_enabled=False, two_face_ratio=0.25)
+    s = sighting("p")
+    off = decide_day([s], face_scores(probe, refs, th_off), {}, {}, {"A": "pA", "B": "pB"}, lambda p: p, th_off)
+    on = decide_day([s], face_scores(probe, refs, th_on), {}, {}, {"A": "pA", "B": "pB"}, lambda p: p, th_on)
+    assert off[0].state == "known"
+    assert on[0].state == "flag" and on[0].relation == "mixed" and "two_faces" in on[0].evidence["reasons"][0]
+
+
+def test_a_low_norm_face_is_not_used():
+    A, B = basis(0), basis(1)
+    refs = {"A": np.stack([near(A, 0.05, RNG) for _ in range(5)]), "B": np.stack([near(B, 0.05, RNG) for _ in range(5)])}
+    probe = {"p": [(0, near(A, 0.05, RNG), 0.9, 60.0, 3.0, 0.0, 0.0)]}  # e.g. hair
+    th = Thresholds(face_sim=0.5, face_margin=0.1, body_enabled=False, min_face_norm=8.0)
+    assert decide_day([sighting("p")], face_scores(probe, refs, th), {}, {}, {"A": "pA"}, lambda p: p, th) == []
+
+
+def test_reference_filters_skip_low_norm_and_two_face_crops():
+    from vbb_reid_server.embed import FaceTable
+    from vbb_reid_server.pipeline import RefPolicy, ref_usable
+    one = np.ones(3)
+    ft = FaceTable(np.array(["a", "b", "c"], dtype=object), np.zeros(3, int), np.array(["cdn"] * 3, dtype=object),
+                   np.zeros((3, 4), np.float32), one * 60, one, one * 500, one, one, one * 0,
+                   np.array([20.0, 3.0, 20.0]), np.array([1, 1, 2]), np.array([0.0, 0.0, 0.5]), np.array([0, 0, 0.9]),
+                   np.array([0.9, 0.9, 0.9]))
+    pol = RefPolicy(ref_min_norm=8.0, ref_two_face_ratio=0.25)
+    assert [ref_usable(ft, i, pol) for i in range(3)] == [True, False, False]
+    assert all(ref_usable(ft, i, RefPolicy()) for i in range(3))
+
+
+def test_verdict_separates_not_enough_evidence_from_failure():
+    from vbb_reid_server.evaluate import needed_trials, verdict
+    row = dict(promote_labeled=218, promote_precision=1.0, promote_lo95_days=1.0, promote_cp_lo=0.98322, loo_n=493,
+               loo_false_accepts=0, loo_fa_cp_hi=0.00745, correct=218, wrong=0, precision_lo95_days=1.0,
+               precision_cp_lo=0.98322)
+    v, _, needs = verdict(row, min_precision_lo=0.99, max_loo_fa=0.005, min_labeled=50)
+    assert v == "insufficient" and needs == {"labeled_promotions": 368, "loo_trials": 736}
+    bad = dict(row, promote_labeled=300, promote_precision=0.95, promote_cp_lo=0.91)
+    assert verdict(bad, min_precision_lo=0.99, max_loo_fa=0.005, min_labeled=50)[0] == "fail"
+    assert needed_trials(285, 300, rate_bound=0.99, upper=False) is None  # 95 % never reaches 0.99

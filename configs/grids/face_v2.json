@@ -1,0 +1,8 @@
+{
+  "_comment": "Face-only, around the stable region found with face_v1 on facility 3, plus the two-faces rule (null = off): 4 x 3 x 3 x 3 = 108 rows. A minimum feature norm is added once quality-report shows where non-faces sit.",
+  "face_sim": [0.30, 0.35, 0.40, 0.45],
+  "face_margin": [0.05, 0.10, 0.15],
+  "face_q_min": [0.0, 0.2, 0.3],
+  "two_face_ratio": [null, 0.25, 0.40],
+  "body_enabled": [false]
+}

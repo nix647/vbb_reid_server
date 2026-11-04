@@ -32,6 +32,12 @@ class Thresholds:
     face_margin: float = 0.10
     face_q_min: float = 0.30
     face_min_px: float = 20.0
+    min_face_norm: float = 0.0  # probe faces need this raw feature norm (0 = off; nan = unknown, kept)
+    # a crop showing a second face at least this share of the chosen face's height (and detector
+    # score >= two_face_det) is ambiguous about whom the track follows: the sighting is flagged
+    # mixed, never named (None = off)
+    two_face_ratio: float | None = None
+    two_face_det: float = 0.6
     topk: int = 3
     min_refs: int = 3
     # mixed-track check on the crops of one sighting
@@ -76,6 +82,7 @@ class FaceScores:
     crop_best: dict[str, list[tuple[int, float, int]]]  # sid -> [(crop_idx, best score, argmax)]
     crop_vecs: dict[str, list[np.ndarray]]  # sid -> usable face vectors (for the mixed check)
     best_q: dict[str, float]
+    two_faces: dict[str, list[tuple[int, float, float]]] = field(default_factory=dict)  # sid -> [(crop, ratio, det)]
 
 
 def _topk_mean(sims: np.ndarray, k: int) -> np.ndarray:
@@ -94,8 +101,15 @@ def _starts_of(refs, p: str) -> np.ndarray:
     return np.arange(refs[p].shape[0])  # a plain dict: every row is its own sighting
 
 
-def face_scores(probe_faces: dict[str, list[tuple[int, np.ndarray, float, float]]],
-                refs, th: Thresholds) -> FaceScores:
+def _unpack(face: tuple) -> tuple[int, np.ndarray, float, float, float, float, float]:
+    """(crop, vec, qf, face_h[, norm, second_ratio, second_det]) -> all seven fields."""
+    if len(face) == 4:
+        c, v, q, h = face
+        return c, v, q, h, float("nan"), 0.0, 0.0
+    return tuple(face)  # type: ignore[return-value]
+
+
+def face_scores(probe_faces: dict[str, list[tuple]], refs, th: Thresholds) -> FaceScores:
     """probe_faces: sid -> [(crop_idx, unit vec, qf, face_h)]; refs: key -> (R, D) unit vecs,
     optionally a ``pipeline.Refs`` grouping rows by labeled sighting. A probe crop's score for
     a person is the mean of its top-k matches over that person's labeled SIGHTINGS (each
@@ -107,9 +121,17 @@ def face_scores(probe_faces: dict[str, list[tuple[int, np.ndarray, float, float]
     crop_best: dict[str, list[tuple[int, float, int]]] = {}
     crop_vecs: dict[str, list[np.ndarray]] = {}
     best_q: dict[str, float] = {}
-    for sid, faces in probe_faces.items():
-        usable = [(c, v, q) for c, v, q, h in faces if q >= th.face_q_min and h >= th.face_min_px]
-        best_q[sid] = max((q for _, _, q, _ in faces), default=0.0)
+    two_faces: dict[str, list[tuple[int, float, float]]] = {}
+    for sid, raw in probe_faces.items():
+        faces = [_unpack(f) for f in raw]
+        if th.two_face_ratio is not None:
+            amb = [(c, r2, d2) for c, _, _, _, _, r2, d2 in faces if r2 >= th.two_face_ratio and d2 >= th.two_face_det]
+            if amb:
+                two_faces[sid] = amb
+        usable = [(c, v, q) for c, v, q, h, nrm, _, _ in faces
+                  if q >= th.face_q_min and h >= th.face_min_px
+                  and not (th.min_face_norm > 0 and nrm == nrm and nrm < th.min_face_norm)]
+        best_q[sid] = max((f[2] for f in faces), default=0.0)
         if not usable or not persons:
             continue
         V = np.stack([v for _, v, _ in usable])
@@ -125,7 +147,7 @@ def face_scores(probe_faces: dict[str, list[tuple[int, np.ndarray, float, float]
         score[sid] = (per * w[:, None]).sum(0) / w.sum()
         crop_best[sid] = [(c, float(per[i].max()), int(per[i].argmax())) for i, (c, _, _) in enumerate(usable)]
         crop_vecs[sid] = [v for _, v, _ in usable]
-    return FaceScores(persons, n_refs, score, crop_best, crop_vecs, best_q)
+    return FaceScores(persons, n_refs, score, crop_best, crop_vecs, best_q, two_faces)
 
 
 def _face_decision(fs: FaceScores, sid: str, th: Thresholds, extra: float = 0.0):
@@ -155,7 +177,7 @@ def _face_opinion(fs: FaceScores, sid: str, th: Thresholds) -> tuple[str, float]
 
 def _is_mixed(fs: FaceScores, sid: str, th: Thresholds, body_crops: list[np.ndarray] | None):
     vecs = fs.crop_vecs.get(sid, [])
-    reasons = []
+    reasons = [f"two_faces:crop{c}:ratio={r:.2f}:det={d:.2f}" for c, r, d in fs.two_faces.get(sid, [])]
     if len(vecs) >= 2:
         sims = [float(vecs[i] @ vecs[j]) for i in range(len(vecs)) for j in range(i + 1, len(vecs))]
         if min(sims) < th.mixed_face_sim:

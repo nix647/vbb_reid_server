@@ -47,6 +47,9 @@ class RefPolicy:
     ref_q_min: float = 0.40  # reference faces need at least this quality
     max_refs: int = 300  # most recent labeled SIGHTINGS per person
     include_same_day: bool = False  # production: True (labels made before the run); eval temporal: False
+    ref_min_norm: float = 0.0  # reference faces need at least this raw feature norm (0 = off)
+    ref_two_face_ratio: float | None = None  # skip reference crops with a second face this large (None = off)
+    ref_two_face_det: float = 0.6
 
 
 class Workspace:
@@ -79,12 +82,14 @@ class Workspace:
 
     # ------------------------------------------------------------- probes --
     def probe_inputs(self, facility: str, day: str):
-        """-> (probe_faces sid->[(crop, vec, qf, face_h)], body sid->unit vec, body_crops sid->[vec])."""
+        """-> (probe_faces sid->[(crop, vec, qf, face_h, norm, second_ratio, second_det)],
+               body sid->unit vec, body_crops sid->[vec])."""
         ft = self.face_table(facility, day)
-        probe_faces: dict[str, list[tuple[int, np.ndarray, float, float]]] = {}
+        probe_faces: dict[str, list[tuple]] = {}
         for i in range(len(ft)):
             probe_faces.setdefault(str(ft.sighting_id[i]), []).append(
-                (int(ft.crop_idx[i]), ft.vec[i], float(ft.qf[i]), float(ft.face_h[i])))
+                (int(ft.crop_idx[i]), ft.vec[i], float(ft.qf[i]), float(ft.face_h[i]), float(ft.norm[i]),
+                 float(ft.second_ratio[i]), float(ft.second_det[i])))
         bt = self.body_table(facility, day)
         body_crops: dict[str, list[np.ndarray]] = {}
         for i in range(len(bt)):
@@ -135,7 +140,7 @@ class Workspace:
                 pos.setdefault(str(sid), []).append(i)
             for s in ss:
                 for i in pos.get(s.sighting_id, []):
-                    if ft.qf[i] >= policy.ref_q_min:
+                    if ref_usable(ft, i, policy):
                         rows.setdefault(self.export.key(s.human_person_id), []).append(
                             (s.capture_ts, s.sighting_id, ft.vec[i]))
         vecs: dict[str, np.ndarray] = {}
@@ -170,6 +175,19 @@ class Workspace:
                 if k and k not in exclude_keys:
                     out[s.sighting_id] = k
         return out
+
+
+def ref_usable(ft: FaceTable, i: int, policy: RefPolicy) -> bool:
+    """Whether crop ``i`` of a labeled sighting may serve as a reference face."""
+    if ft.qf[i] < policy.ref_q_min:
+        return False
+    norm = float(ft.norm[i])
+    if policy.ref_min_norm > 0 and not (norm != norm) and norm < policy.ref_min_norm:  # nan: unknown -> keep
+        return False
+    if policy.ref_two_face_ratio is not None and ft.second_ratio[i] >= policy.ref_two_face_ratio \
+            and ft.second_det[i] >= policy.ref_two_face_det:
+        return False
+    return True
 
 
 def org_facilities(export: Export, facility: str) -> list[str]:

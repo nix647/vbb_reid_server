@@ -51,7 +51,7 @@ echo 'export HF_HOME=/vmdata/vbb_eval/hf' >> ~/.bashrc && export HF_HOME=/vmdata
 cd ~/vbb_reid_server && pytest -q && vbb-reid-server doctor
 ```
 
-Expected: `57 passed` (0.1.2 + configs); `onnxruntime ... providers [...'CUDAExecutionProvider'...]`;
+Expected: `62 passed` (0.1.3); `onnxruntime ... providers [...'CUDAExecutionProvider'...]`;
 `torch ... cuda available=True, device NVIDIA GeForce RTX 4070 Ti SUPER`.
 If `CUDAExecutionProvider` is missing, the CPU build may have been installed next to the GPU build
 (0.1.0/0.1.1's `dev` extra pulled it in; both provide the same module). Fix and check again:
@@ -247,6 +247,68 @@ done
 `unreadable` or `cdn_failed` above 0); the `qf` section of each quality-report; and the `[eval]`
 summary blocks (both facilities, both reference modes, both policies). The `curve.csv` files stay
 on the box; I will ask for specific rows if needed.
+
+## 6d. Non-faces, two-person crops, and the independent check (0.1.3)
+
+0.1.3 stores three more measures per face (raw feature norm, number of faces in the crop, size
+and score of the second face). The cache schema changed, so `embed` re-embeds every day once —
+GPU only, the crops are on disk:
+
+```bash
+cd ~/vbb_reid_server && git pull && pip install -e '.[onnx,hf,dev]' --no-deps && pytest -q
+vbb-reid-server embed --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv \
+  --emb /vmdata/vbb_eval/emb --models /vmdata/vbb_eval/models/buffalo_l_face.json \
+  --facility 3 2 --lan-crops /vmdata/vbb_eval/crops --cdn-cache /vmdata/vbb_eval/cdn --no-fetch 2>&1 | tail -3
+```
+
+1. Look at the reviewed faces the way the decision sees them (`inspect`; use your `point_3_temporal.json`):
+
+```bash
+vbb-reid-server inspect --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv \
+  --emb /vmdata/vbb_eval/emb --face-model RGB:m127.5 --facility 3 --sightings a2edee5618ff \
+  --point /vmdata/vbb_eval/out/eval_A_default/point_3_temporal.json
+vbb-reid-server inspect --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv \
+  --emb /vmdata/vbb_eval/emb --face-model RGB:m127.5 --facility 2 --sightings 81e8e70dc82f,83c78b81f9ed,07e911a53a04 \
+  --point /vmdata/vbb_eval/out/eval_A_default/point_3_temporal.json --refs-mode lodo
+```
+
+2. Where do the new measures put non-faces and second faces (policy A is enough here):
+
+```bash
+vbb-reid-server quality-report --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv \
+  --emb /vmdata/vbb_eval/emb --face-model RGB:m127.5 --facility 3 --quality configs/quality/A_default.json \
+  --out /vmdata/vbb_eval/out/quality_A_f3_v013.csv | sed -n '/norm/,$p'
+```
+
+3. Evaluate with the two-faces sweep (the gate now prints PASS / FAIL / NOT ENOUGH EVIDENCE YET):
+
+```bash
+for P in A_default B_tuned_2026-11-04; do
+  vbb-reid-server eval --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv \
+    --emb /vmdata/vbb_eval/emb --face-model RGB:m127.5 --facility 3 2 --grid configs/grids/face_v2.json \
+    --quality configs/quality/$P.json --setup "buffalo_l face v2, policy $P" --out /vmdata/vbb_eval/out/eval_v2_$P 2>&1 \
+    | grep -A12 '^\[eval\] facility'
+done
+```
+
+4. The independent check: shadow facility 3 at each policy's temporal operating point, then score
+it against your 300 adjudication answers (copy the CSV to `/vmdata/vbb_eval/adj/` first):
+
+```bash
+for P in A_default B_tuned_2026-11-04; do
+  vbb-reid-server shadow --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv \
+    --emb /vmdata/vbb_eval/emb --face-model RGB:m127.5 --facility 3 \
+    --point /vmdata/vbb_eval/out/eval_v2_$P/point_3_temporal.json --out /vmdata/vbb_eval/out/shadow_$P
+  vbb-reid-server adjudicate-score --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv \
+    --answers /vmdata/vbb_eval/adj/adjudication_adjudication_f3_set1_sample.csv \
+    --labels /vmdata/vbb_eval/out/shadow_$P/labels_3_*.csv | tee /vmdata/vbb_eval/out/adjscore_$P.json
+done
+```
+
+**Send me**: the `inspect` output; the norm / second_ratio / n_faces sections; the `[eval]` blocks with
+their VERDICT lines; and both `adjudicate-score` results. Keep using the as-exported export for
+these runs (your reviewed copies were a good diagnostic; the guards above are meant to make them
+unnecessary).
 
 ## 7. After that (I will send the exact commands with the results of step 6b)
 
