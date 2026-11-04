@@ -475,9 +475,11 @@ If the answers file of the new-names set has another name in `$A`, use that name
 
 ## 6h. The production run (0.2.0): not yet
 
-`vbb-reid-server run` is the nightly job of Phase B: it registers a run with the backend, pulls the
-day's sightings and the references, embeds, decides with the same code as `shadow`, pushes the labels
-(inactive until someone activates them), finishes, and deletes the crops it downloaded. The backend
+`vbb-reid-server run` is the nightly job of Phase B: it pulls the day's sightings and the references,
+embeds what the cache lacks, decides with the same code as `shadow`, then registers a run, pushes the
+labels (inactive until someone activates them on the app host; the worker never activates), finishes,
+and deletes the crops it downloaded. Give it its own crop folder (`--cdn-cache /vmdata/vbb_run/cdn`),
+never the Phase A cache: it deletes what it downloads and anything older than a day. The backend
 side (`/worker/*`) is not built yet, so there is nothing to run it against; it is tested against an
 in-memory backend only. When the backend is up you will get a token file and these exact commands.
 

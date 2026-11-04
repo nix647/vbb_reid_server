@@ -18,7 +18,7 @@ CDN crops ────┼─► embed ─► embedding cache ─► eval ──�
 LAN crops ────┘   (GPU)    (per model)        shadow ───► labels_*.csv, run_*.json
                                               adjudicate ► sample.csv → page.html → answers.csv → score
 
-/worker API ─► run: register → pull → embed → decide (same code as shadow) → push → finish
+/worker API ─► run: pull → embed → decide (same code as shadow) → register → push → finish (never activates)
 ```
 
 - **References** are human-labeled `known` crops only (no self-training).

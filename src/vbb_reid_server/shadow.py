@@ -53,10 +53,12 @@ def decide_night(ws: Workspace, facility: str, day: str, th: Thresholds, policy:
 
 def shadow_run(ws: Workspace, facility: str, day: str, th: Thresholds, out_dir: str | Path, *,
                policy: RefPolicy = RefPolicy(include_same_day=True), label_cutoff_ms: int | str | None = RUN_AT_DAY_END,
-               model_name: str = "", run_id: str | None = None, decided: dict | None = None, log=print) -> dict:
+               model_name: str = "", run_id: str | None = None, decided: dict | None = None,
+               report_key=None, log=print) -> dict:
     """``label_cutoff_ms``: ``"run"`` (default, production-like), an epoch-ms value, or ``None``
     (every label in the export — only for debugging; it leaks the future).
-    ``decided``: a ``decide_night`` result to write instead of deciding again (the production run)."""
+    ``decided``: a ``decide_night`` result to write instead of deciding again (the production run).
+    ``report_key``: person_id -> key written in ``person_key`` (default: the decision's own key)."""
     ex = ws.export
     run_id = run_id or uuid.uuid4().hex
     started = time.time()
@@ -80,7 +82,9 @@ def shadow_run(ws: Workspace, facility: str, day: str, th: Thresholds, out_dir: 
                 "run_id": run_id, "sighting_id": l.sighting_id, "facility_id": facility, "day": day,
                 "did": s.did, "room_id": s.room_id, "board_state": s.board_state,
                 "board_person_id": s.board_person_id or "", "state": l.state, "relation": l.relation,
-                "person_id": l.person_id or "", "person_key": l.person_key or "", "via": l.via,
+                "person_id": l.person_id or "",
+                "person_key": (report_key(l.person_id) if report_key and l.person_id else l.person_key) or "",
+                "via": l.via,
                 "confidence": l.confidence, "margin": "" if l.margin is None else l.margin,
                 "face_sim": "" if l.face_sim is None else l.face_sim,
                 "body_sim": "" if l.body_sim is None else l.body_sim,

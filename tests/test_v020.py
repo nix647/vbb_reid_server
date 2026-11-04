@@ -22,6 +22,7 @@ from vbb_reid_server.run import Guards, label_row, model_id_of, run_night
 
 TZ = ZoneInfo("Asia/Shanghai")
 TOKEN = "s3cret-worker-token"
+ADMIN = "s3cret-admin-token-1"
 
 
 def ms(y, mo, d, h=10, mi=0):
@@ -29,16 +30,24 @@ def ms(y, mo, d, h=10, mi=0):
 
 
 # ---------------------------------------------------------------- fake backend --
+class Refused(Exception):
+    pass
+
+
 class FakeBackend:
     """The /worker API as machine_labels.md §3 describes it, in memory. Pages of ``page`` rows."""
 
-    def __init__(self, sightings, references, roster, *, tz="Asia/Shanghai", page=2, reject=None):
+    def __init__(self, sightings, references, roster, *, tz="Asia/Shanghai", page=2, reject=None,
+                 sightings_tz=True):
         self.sightings, self.references, self.roster, self.tz, self.page = sightings, references, roster, tz, page
+        self.sightings_tz = sightings_tz
         self.reject = reject or {}  # sighting_id -> reason
         self.calls: list[tuple[str, dict]] = []
         self.runs: dict[str, dict] = {}
         self.labels: dict[tuple[str, str], dict] = {}
         self.fail: dict[str, list] = {}  # path -> queue of (status, body) to return before the real answer
+        self.lose_answer: dict[str, int] = {}  # path -> how many handled requests lose their answer
+        self.pushed_ever: set[str] = set()
 
     def _page(self, rows, cursor):
         start = int(cursor or 0)
@@ -53,12 +62,30 @@ class FakeBackend:
         if self.fail.get(path):
             status, out = self.fail[path].pop(0)
             return status, json.dumps(out).encode() if isinstance(out, dict) else out
-        if headers.get("Authorization") != f"Bearer {TOKEN}":
-            return 200, json.dumps({"code": 401, "message": "bad token", "action": None, "data": None}).encode()
-        data = getattr(self, "_" + path.replace("/", "_"))(payload)
-        return 200, json.dumps({"code": 200, "message": "ok", "action": None, "data": data}).encode()
+        auth = headers.get("Authorization")
+        if auth not in (f"Bearer {TOKEN}", f"Bearer {ADMIN}"):
+            return 200, self._env(401, "bad token")
+        if path.endswith(("activate", "revert")) and auth != f"Bearer {ADMIN}":
+            return 200, self._env(1002, "admin scope required")
+        try:
+            data = getattr(self, "_" + path.replace("/", "_"))(payload)
+        except Refused as e:
+            return 200, self._env(1002, str(e))
+        out = self._env(200, "ok", data)
+        if self.lose_answer.get(path):  # the request was handled; the answer never arrives
+            self.lose_answer[path] -= 1
+            return 504, b"gateway timeout"
+        return 200, out
+
+    lose_answer: dict = {}
+
+    @staticmethod
+    def _env(code, message, data=None):
+        return json.dumps({"code": code, "message": message, "action": None, "data": data}).encode()
 
     def _worker_runs_register(self, p):
+        if p["run_id"] in self.runs:  # idempotent: the same run again returns it (machine_labels.md §3)
+            return {"run_id": p["run_id"], "lease_until": 0}
         self.runs[p["run_id"]] = {"status": "running", **p}
         return {"run_id": p["run_id"], "lease_until": 0}
 
@@ -66,7 +93,10 @@ class FakeBackend:
         rows = [s for s in self.sightings if s["_day"] == p["day"]]
         rows = [{k: v for k, v in s.items() if not k.startswith("_")} for s in rows]
         chunk, nxt = self._page(rows, p.get("cursor"))
-        return {"sightings": chunk, "next_cursor": nxt, "time_zone": self.tz}
+        out = {"sightings": chunk, "next_cursor": nxt}
+        if self.sightings_tz:
+            out["time_zone"] = self.tz
+        return out
 
     def _worker_references_pull(self, p):
         rows = [r for r in self.references if r["capture_ts"] >= p["since_ts"]]
@@ -77,11 +107,15 @@ class FakeBackend:
         return out
 
     def _worker_labels_push(self, p):
-        assert self.runs[p["run_id"]]["status"] == "running"
+        if self.runs.get(p["run_id"], {}).get("status") != "running":
+            raise Refused("run is not running")
         assert 1 <= len(p["rows"]) <= 500
+        overlay = {s["sighting_id"] for s in self.sightings if s.get("human_labeled")}
         rejected = []
         for r in p["rows"]:
-            reason = self.reject.get(r["sighting_id"])
+            self.pushed_ever.add(r["sighting_id"])
+            reason = self.reject.get(r["sighting_id"]) or ("human_labeled" if r["sighting_id"] in overlay
+                                                           and r["state"] == "known" else None)
             if reason:
                 rejected.append({"sighting_id": r["sighting_id"], "reason": reason})
             else:
@@ -89,19 +123,29 @@ class FakeBackend:
         return {"accepted": len(p["rows"]) - len(rejected), "rejected": rejected}
 
     def _worker_runs_finish(self, p):
-        self.runs[p["run_id"]].update(status=p["status"], counts=p["counts"], error=p.get("error"))
+        run = self.runs.get(p["run_id"])
+        if run is None:
+            raise Refused("unknown run")
+        if run["status"] == p["status"]:  # idempotent
+            return {"run_id": p["run_id"], "status": run["status"]}
+        if run["status"] != "running":
+            raise Refused(f"run is {run['status']}")
+        run.update(status=p["status"], counts=p["counts"], error=p.get("error"))
         return {"run_id": p["run_id"], "status": p["status"]}
 
     def _worker_runs_activate(self, p):
-        self.runs[p["run_id"]]["status"] = "activated"
+        run = self.runs[p["run_id"]]
+        if run["status"] not in ("done", "activated"):
+            raise Refused(f"run is {run['status']}")
+        run["status"] = "activated"
         return {"run_id": p["run_id"], "status": "activated"}
 
     def paths(self):
         return [c[0] for c in self.calls]
 
 
-def client_for(fake, **kw):
-    return BackendClient("https://backend.example/api", TOKEN, transport=fake, sleep=lambda s: None, **kw)
+def client_for(fake, token=TOKEN, **kw):
+    return BackendClient("https://backend.example/api", token, transport=fake, sleep=lambda s: None, **kw)
 
 
 # ----------------------------------------------------------------- the client --
@@ -136,7 +180,7 @@ def test_a_transport_failure_is_retried_and_then_given_up():
 
 def test_the_token_never_appears_in_errors_or_repr():
     fake = FakeBackend([], [], [])
-    c = BackendClient("https://backend.example/api", "wrong-token", transport=fake, sleep=lambda s: None)
+    c = BackendClient("https://backend.example/api", "wrong-token-0123456", transport=fake, sleep=lambda s: None)
     with pytest.raises(BackendError) as e:
         c.call("worker/runs/finish", {})
     assert e.value.code == 401
@@ -261,11 +305,17 @@ def _night(tmp_path, *, reject=None):
 
 
 class FakeStore:
-    def __init__(self):
+    def __init__(self, stats=None):
         self.deleted = 0
+        self.pruned = []
+        self.stats = stats or {"lan": 0, "cdn_hit": 3, "cdn_fetched": 0, "cdn_failed": 0, "missing": 0}
 
     def delete_fetched(self):
         self.deleted += 1
+        return 0
+
+    def prune_cdn(self, days):
+        self.pruned.append(days)
         return 0
 
 
@@ -281,17 +331,22 @@ def test_a_night_registers_pushes_only_unlabeled_sightings_and_finishes(tmp_path
     store = FakeStore()
     out = _run(tmp_path, fake, store=store)
 
-    assert fake.paths()[0] == "worker/runs/register" and fake.paths()[-1] == "worker/runs/finish"
-    reg = fake.calls[0][1]
+    paths = fake.paths()
+    assert paths[-1] == "worker/runs/finish"
+    assert paths.index("worker/runs/register") > max(i for i, p in enumerate(paths) if p.endswith("/pull")), \
+        "register comes after the pulls and the decision, so the lease covers only push and finish"
+    assert paths.index("worker/runs/register") < paths.index("worker/labels/push")
+    reg = fake.calls[paths.index("worker/runs/register")][1]
     assert reg["facility_id"] == 3 and reg["day"] == DAY and reg["worker_id"] == "gpu-ubun"
-    assert reg["model_id"] == model_id_of(FACE_ID, None) and reg["model_id"].endswith("vbb-reid-server 0.2.0")
+    from vbb_reid_server import __version__
+    assert reg["model_id"] == model_id_of(FACE_ID, None) and reg["model_id"].endswith(f"vbb-reid-server {__version__}")
     assert reg["thresholds"]["ref_policy"]["roster_only"] is True, "production always uses the roster-only rule"
     pushed = {sid: r for (sid, run), r in fake.labels.items()}
     assert set(pushed) == {"q1"}, "q2 is human-labeled (never pushed); q3 looks like nobody (no row)"
     assert (pushed["q1"]["state"], pushed["q1"]["relation"], pushed["q1"]["person_id"]) == ("known", "promote", "pA")
     run = fake.runs[out["run_id"]]
     assert run["status"] == "done" and run["counts"]["pushed_promote"] == 1 and run["counts"]["accepted"] == 1
-    assert store.deleted == 1, "downloaded crops are deleted when the run ends"
+    assert store.deleted == 1 and store.pruned == [1.0], "downloaded crops and day-old leftovers are deleted"
     files = sorted(p.name for p in (tmp_path / "out").iterdir())
     assert any(f.startswith(f"labels_3_{DAY}_{out['run_id'][:8]}") for f in files)
     with open(next((tmp_path / "out").glob("labels_*.csv")), newline="", encoding="utf-8") as fh:
@@ -299,23 +354,20 @@ def test_a_night_registers_pushes_only_unlabeled_sightings_and_finishes(tmp_path
     assert local["q2"]["human_labeled"] == "1", "the local file still shows the decision on q2"
 
 
-def test_activation_needs_the_flag_and_clean_guards(tmp_path):
+def test_the_worker_never_activates_and_reports_its_guards(tmp_path):
     fake = _night(tmp_path)
     out = _run(tmp_path, fake)
-    assert fake.runs[out["run_id"]]["status"] == "done", "no --activate: stays done"
-
-    fake = _night(tmp_path)
-    out = _run(tmp_path, fake, activate=True)
-    assert fake.runs[out["run_id"]]["status"] == "activated"
+    assert "worker/runs/activate" not in fake.paths() and fake.runs[out["run_id"]]["status"] == "done"
+    assert fake.runs[out["run_id"]]["counts"]["guard_failures"] == 0
 
     fake = _night(tmp_path, reject={"q1": "not_in_roster"})
-    out = _run(tmp_path, fake, activate=True)
-    assert fake.runs[out["run_id"]]["status"] == "done" and out["guard_failures"]
+    out = _run(tmp_path, fake)
+    assert out["guard_failures"] and fake.runs[out["run_id"]]["counts"]["guard_failures"] == 1
     assert fake.runs[out["run_id"]]["counts"]["rejected_not_in_roster"] == 1
 
     fake = _night(tmp_path)
-    out = _run(tmp_path, fake, activate=True, guards=Guards(max_promote_share=0.2))
-    assert fake.runs[out["run_id"]]["status"] == "done", "1 promotion of 3 sightings is above 20 %"
+    out = _run(tmp_path, fake, guards=Guards(max_promote_share=0.2))
+    assert fake.runs[out["run_id"]]["counts"]["guard_failures"] == 1, "1 promotion of 3 sightings is above 20 %"
 
 
 def test_a_failure_after_register_marks_the_run_failed(tmp_path):

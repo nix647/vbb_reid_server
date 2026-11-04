@@ -74,6 +74,12 @@ class Sighting:
         return self.human_state in ("known", "stranger")
 
     @property
+    def has_overlay(self) -> bool:
+        """Any human overlay, including a reset to pending. The backend refuses a machine ``known``
+        row for such a sighting; the production run pushes nothing for it at all."""
+        return self.human_state is not None
+
+    @property
     def interval_ms(self) -> tuple[int, int]:
         start = self.track_started_ts if self.track_started_ts is not None else self.capture_ts
         end = self.track_ended_ts if self.track_ended_ts is not None else self.capture_ts

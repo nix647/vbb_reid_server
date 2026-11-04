@@ -205,14 +205,19 @@ def cmd_shadow(args) -> None:
     for name in ("window_days", "ref_q_min", "max_refs", "ref_min_norm", "ref_two_face_ratio"):
         if getattr(args, name) is not None:
             policy = replace(policy, **{name: getattr(args, name)})
+    report_key = None
     if args.roster_only_refs:
+        # Production has no alias file: decide with person ids folded through merges only, and report
+        # the alias key in the labels file so adjudicate-score still matches the answers.
         policy = replace(policy, roster_only=True)
+        report_key = ex.key
+        ex = replace(ex, aliases={})
     ws = Workspace(ex, args.emb, face_id, body_id, quality)
     days = args.days.split(",") if args.days else ex.days(args.facility)
     cutoff = "run" if args.labels_until == "run" else None
     for day in days:
         shadow_run(ws, args.facility, day, th, args.out, policy=policy, label_cutoff_ms=cutoff,
-                   model_name=args.setup or "")
+                   model_name=args.setup or "", report_key=report_key)
 
 
 def _point(path: str) -> tuple[Thresholds, QualityPolicy, RefPolicy]:
@@ -235,13 +240,22 @@ def _run_days(args) -> list[str]:
     return [date.fromisoformat(args.day).isoformat()]
 
 
+def _read_token(path: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError as e:
+        raise SystemExit(f"cannot read token file {path}: {e.strerror}") from None
+
+
 def cmd_run(args) -> None:
-    from .api import BackendClient, BackendError
+    import signal
+    from .api import BackendClient
     from .crops import CropStore
     from .run import Guards, run_night
-    token = Path(args.token_file).read_text(encoding="utf-8").strip()
-    if not token:
-        raise SystemExit(f"{args.token_file} is empty (it must hold the worker token)")
+    try:
+        client = BackendClient(args.backend, _read_token(args.token_file))
+    except ValueError as e:  # the message never contains the token
+        raise SystemExit(str(e)) from None
     th, quality, policy = _point(args.point)
     if args.max_refs is not None:
         policy = replace(policy, max_refs=args.max_refs)
@@ -254,17 +268,20 @@ def cmd_run(args) -> None:
     else:
         face_id = _ids_from_cache(args.emb, "face", args.face_model)
         body_id = _ids_from_cache(args.emb, "body", args.body_model)
-    client = BackendClient(args.backend, token)
     store = CropStore(args.lan_crops, args.cdn_cache)
+
+    def _term(signum, frame):  # systemd stops a unit with SIGTERM: finish the run as failed, then exit
+        raise SystemExit(f"stopped by signal {signum}")
+    signal.signal(signal.SIGTERM, _term)
     failed = []
     for day in _run_days(args):
         try:
             run_night(client, int(args.facility), day, th=th, quality=quality, policy=policy, emb_root=args.emb,
                       out_dir=args.out, models=models, face_id=face_id, body_id=body_id, store=store,
-                      tz_name=args.tz, dry_run=args.dry_run, activate=args.activate,
-                      guards=Guards(max_promote_share=args.max_promote_share), keep_crops=args.keep_crops)
-        except (BackendError, OSError, ValueError) as e:
-            print(f"[run] {args.facility} {day}: FAILED: {e}", file=sys.stderr)
+                      tz_name=args.tz, dry_run=args.dry_run, guards=Guards(max_promote_share=args.max_promote_share), keep_crops=args.keep_crops)
+        except Exception as e:  # one bad day must not stop the rest of a range; never echo the token
+            print(f"[run] {args.facility} {day}: FAILED: {client.redact(f'{e.__class__.__name__}: {e}')}",
+                  file=sys.stderr)
             failed.append(day)
     if failed:
         raise SystemExit(f"[run] failed day(s): {', '.join(failed)}")
@@ -490,8 +507,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="run (default): only labels that existed at that night's run; all: every label in the "
                          "export (debugging only - it leaks the future)")
     sp.add_argument("--roster-only-refs", action="store_true",
-                    help="use only labels whose person (merges followed, alias file ignored) is on this facility's "
-                         "own roster - the rule production's references/pull applies")
+                    help="decide as production does: no alias file (ids folded through merges only) and only labels "
+                         "of this facility's own roster; the labels file still reports alias keys for scoring")
     sp.add_argument("--setup")
     sp.add_argument("--out", required=True)
     sp.set_defaults(fn=cmd_shadow)
@@ -508,15 +525,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--face-model", help="cached face model (without --models)")
     sp.add_argument("--body-model", help="cached body model (without --models)")
     sp.add_argument("--emb", required=True, help="embedding cache root")
-    sp.add_argument("--cdn-cache", required=True, help="where crops are downloaded for the run (deleted afterwards)")
+    sp.add_argument("--cdn-cache", required=True,
+                    help="the run's OWN crop folder (crops are deleted afterwards; never the Phase A cache)")
     sp.add_argument("--lan-crops", help="LAN crop copies from the test boards")
     sp.add_argument("--out", required=True, help="folder for the run's local CSV/JSON")
     sp.add_argument("--max-refs", type=int)
     sp.add_argument("--window-days", type=int)
     sp.add_argument("--dry-run", action="store_true",
                     help="pull and decide, write the local files, register and push nothing")
-    sp.add_argument("--activate", action="store_true", help="activate the run when its guards pass (admin token)")
-    sp.add_argument("--max-promote-share", type=float, help="guard: promotions / sightings above this refuse activation")
+    sp.add_argument("--max-promote-share", type=float,
+                    help="guard: promotions / sightings above this are reported as a guard failure (the worker never "
+                         "activates; activation is on the app host)")
     sp.add_argument("--keep-crops", action="store_true", help="keep the downloaded crops (debugging)")
     sp.set_defaults(fn=cmd_run)
 
