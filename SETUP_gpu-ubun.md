@@ -462,16 +462,25 @@ for SET in adjudication_sample_f3_lownorm adjudication_adjudication_f3_set1_samp
 done
 python3 - "$O/shadow" "$G/shadow_roster" <<'PY'
 import csv, glob, sys
-for d in sys.argv[1:]:
-    n = sum(1 for f in glob.glob(d + "/labels_3_*.csv") for r in csv.DictReader(open(f, encoding="utf-8"))
-            if r["state"] == "known" and r["relation"] == "promote" and r["human_labeled"] == "0")
-    print(f"{d}: {n} new names")
+def names(d):
+    return {r["sighting_id"]: r["person_key"] for f in glob.glob(d + "/labels_3_*.csv")
+            for r in csv.DictReader(open(f, encoding="utf-8"))
+            if r["state"] == "known" and r["relation"] == "promote" and r["human_labeled"] == "0"}
+old, new = names(sys.argv[1]), names(sys.argv[2])
+print(f"new names: Phase A {len(old)}, production rule {len(new)}")
+print(f"  same sighting, same person: {sum(1 for s in new if old.get(s) == new[s])}")
+print(f"  same sighting, OTHER person: {sum(1 for s in new if s in old and old[s] != new[s])}")
+print(f"  named only under the production rule (never in the Phase A pool): {sum(1 for s in new if s not in old)}")
 PY
 ```
 
 If the answers file of the new-names set has another name in `$A`, use that name in the loop.
 
-**Send me** the three score lines and the two new-name counts.
+**Send me** the three score lines and the four counts. What decides the next step: the 200-name
+sample was drawn from the Phase A pool, so it covers only the "same sighting, same person" names.
+If the other two counts are small, the 0.98 result carries over; if not, the production rule needs
+its own uniform sample of the names it alone produces (I will tell you how many labels before
+asking for any).
 
 ## 6h. The production run (0.2.0): not yet
 
