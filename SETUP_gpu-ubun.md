@@ -441,14 +441,47 @@ blocks, the two score files, and later the new-names answers. Reading the new-na
 in 200 gives a lower bound of 0.982; proving 0.99 at zero errors takes 368. Two hundred first is a
 cheap stop if errors appear; extend to 368+ if it is clean.
 
-## 7. After that (I will send the exact commands with the results of step 6b)
+## 6g. The reference rule production will use (0.2.0, no new labels)
 
-- full embed of facilities 2 and 3 (face), ~2 h at the measured rate (estimate);
-- `eval` → curves and operating point, sweeping the quality cutoff too;
-- body candidate (SigLIP2) embed and `eval` with body linking;
-- `shadow --point point_3_temporal.json` on facility 3 (uses only labels that existed at each
-  night's run) and `adjudicate-score` against `adjudication_f3_set1.csv` (excludes sightings that
-  carry a human label; reports pooled and population-weighted precision).
+Phase A unified each person's facility-2 and facility-3 ids with your alias file. Production has no
+alias file, so the backend will send only labels of **this facility's own roster**. Without that,
+the same person under two ids would compete with themselves and the machine would abstain. This step
+re-runs the passing operating point (E8) under that rule and scores it on the three answer sets you
+already labeled. Expect the same or fewer new names and no new wrong ones; send me the numbers.
+
+```bash
+cd ~/vbb_reid_server && git pull && pip install -e '.[onnx,hf,dev]' --no-deps && pytest -q
+O=/vmdata/vbb_eval/out/v015; G=/vmdata/vbb_eval/out/v020; mkdir -p $G; A=/vmdata/vbb_eval/adj
+COMMON="--export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv --emb /vmdata/vbb_eval/emb --face-model RGB:m127.5"
+vbb-reid-server shadow $COMMON --facility 3 --point $O/eval_v4_refs50/point_3_temporal.json --roster-only-refs \
+  --out $G/shadow_roster >/dev/null
+for SET in adjudication_sample_f3_lownorm adjudication_adjudication_f3_set1_sample answers_f3_newnames; do
+  echo "$SET:"; vbb-reid-server adjudicate-score --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv \
+    --answers $A/$SET.csv --labels $G/shadow_roster/labels_3_*.csv \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); print({k: d[k] for k in ('correct','wrong','abstain','stranger_false_accepts','precision_cp_lo')}, 'wrong:', d['wrong_ids'])"
+done
+python3 - "$O/shadow" "$G/shadow_roster" <<'PY'
+import csv, glob, sys
+for d in sys.argv[1:]:
+    n = sum(1 for f in glob.glob(d + "/labels_3_*.csv") for r in csv.DictReader(open(f, encoding="utf-8"))
+            if r["state"] == "known" and r["relation"] == "promote" and r["human_labeled"] == "0")
+    print(f"{d}: {n} new names")
+PY
+```
+
+If the answers file of the new-names set has another name in `$A`, use that name in the loop.
+
+**Send me** the three score lines and the two new-name counts.
+
+## 6h. The production run (0.2.0): not yet
+
+`vbb-reid-server run` is the nightly job of Phase B: it registers a run with the backend, pulls the
+day's sightings and the references, embeds, decides with the same code as `shadow`, pushes the labels
+(inactive until someone activates them), finishes, and deletes the crops it downloaded. The backend
+side (`/worker/*`) is not built yet, so there is nothing to run it against; it is tested against an
+in-memory backend only. When the backend is up you will get a token file and these exact commands.
+
+## 7. Notes
 
 `--face-model` / `--body-model` take a cache slug or a substring of the model id that matches
 exactly one cached model; ambiguous names are refused. `vbb-reid-server doctor --models <cfg>`

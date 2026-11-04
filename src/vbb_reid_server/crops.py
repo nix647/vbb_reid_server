@@ -43,6 +43,7 @@ class CropStore:
         self.retries = retries
         self.user_agent = user_agent
         self.stats = {"lan": 0, "cdn_hit": 0, "cdn_fetched": 0, "cdn_failed": 0, "missing": 0}
+        self.fetched: list[Path] = []  # crops this store downloaded (a production run deletes them afterwards)
 
     # ------------------------------------------------------------- lookup --
     def lan_crops(self, s: Sighting) -> list[CropRef]:
@@ -83,6 +84,7 @@ class CropStore:
                     raise OSError("empty body")
                 os.replace(tmp, dest)
                 self.stats["cdn_fetched"] += 1
+                self.fetched.append(dest)
                 return CropRef(s.sighting_id, 0, dest, "cdn")
             except Exception:
                 if attempt < self.retries:
@@ -104,6 +106,18 @@ class CropStore:
             self.stats["missing"] += 1
             return []
         return [c]
+
+    def delete_fetched(self) -> int:
+        """Delete every crop this store downloaded. Returns files removed."""
+        n = 0
+        for p in self.fetched:
+            try:
+                p.unlink()
+                n += 1
+            except FileNotFoundError:
+                pass
+        self.fetched = []
+        return n
 
     # -------------------------------------------------------------- prune --
     def prune_cdn(self, older_than_days: float) -> int:

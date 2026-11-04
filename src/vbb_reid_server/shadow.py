@@ -33,24 +33,37 @@ LABEL_FIELDS = ["run_id", "sighting_id", "facility_id", "day", "did", "room_id",
                 "margin", "face_sim", "body_sim", "human_labeled", "evidence"]
 
 
-def shadow_run(ws: Workspace, facility: str, day: str, th: Thresholds, out_dir: str | Path, *,
-               policy: RefPolicy = RefPolicy(include_same_day=True), label_cutoff_ms: int | str | None = RUN_AT_DAY_END,
-               model_name: str = "", log=print) -> dict:
-    """``label_cutoff_ms``: ``"run"`` (default, production-like), an epoch-ms value, or ``None``
-    (every label in the export — only for debugging; it leaks the future)."""
+def decide_night(ws: Workspace, facility: str, day: str, th: Thresholds, policy: RefPolicy,
+                 label_cutoff_ms: int | None) -> dict:
+    """The decision for one facility-day, shared by the offline shadow and the production run.
+    -> {labels, sightings, refs, seeds}."""
     ex = ws.export
-    run_id = uuid.uuid4().hex
-    started = time.time()
     facs = org_facilities(ex, facility)
-    label_cutoff_ms = _cutoff(ws, facility, day, label_cutoff_ms)
     roster = ex.roster(facility)
-    refs = ws.references(facs, day, label_cutoff_ms=label_cutoff_ms, policy=policy)
+    refs = ws.references(facs, day, label_cutoff_ms=label_cutoff_ms, policy=policy,
+                         roster_ids=ex.roster_ids(facility) if policy.roster_only else None)
     seeds = ws.human_seeds(facility, day, label_cutoff_ms)
     sightings = ex.by_facility_day(facility, day)
     probe_faces, body, body_crops = ws.probe_inputs(facility, day)
     fs = face_scores(probe_faces, refs, th)
     labels: list[MachineLabel] = decide_day(sightings, fs, body, body_crops, roster, ex.key, th, human_seeds=seeds,
                                             body_index=BodyIndex.build(sightings, body) if body else None)
+    return {"labels": labels, "sightings": sightings, "refs": refs, "seeds": seeds}
+
+
+def shadow_run(ws: Workspace, facility: str, day: str, th: Thresholds, out_dir: str | Path, *,
+               policy: RefPolicy = RefPolicy(include_same_day=True), label_cutoff_ms: int | str | None = RUN_AT_DAY_END,
+               model_name: str = "", run_id: str | None = None, decided: dict | None = None, log=print) -> dict:
+    """``label_cutoff_ms``: ``"run"`` (default, production-like), an epoch-ms value, or ``None``
+    (every label in the export — only for debugging; it leaks the future).
+    ``decided``: a ``decide_night`` result to write instead of deciding again (the production run)."""
+    ex = ws.export
+    run_id = run_id or uuid.uuid4().hex
+    started = time.time()
+    label_cutoff_ms = _cutoff(ws, facility, day, label_cutoff_ms)
+    if decided is None:
+        decided = decide_night(ws, facility, day, th, policy, label_cutoff_ms)
+    labels, sightings, refs, seeds = decided["labels"], decided["sightings"], decided["refs"], decided["seeds"]
     by_sid = {s.sighting_id: s for s in sightings}
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)

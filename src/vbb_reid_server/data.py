@@ -117,6 +117,24 @@ class Export:
             p = self.people.get(person_id)
         return self.aliases.get(person_id, person_id)
 
+    def fold(self, person_id: str | None) -> str | None:
+        """Follow ``merged_into`` to the surviving id, WITHOUT the alias file. The backend's own
+        notion of "the same person"; aliases are an offline device for ids the backend keeps apart."""
+        if not person_id:
+            return None
+        seen = {person_id}
+        p = self.people.get(person_id)
+        while p is not None and p.merged_into and p.merged_into not in seen:
+            person_id = p.merged_into
+            seen.add(person_id)
+            p = self.people.get(person_id)
+        return person_id
+
+    def roster_ids(self, facility_id: str) -> set[str]:
+        """The facility's registered ids (non-tentative, non-merged), as the backend lists them."""
+        return {pid for pid, p in self.people.items()
+                if p.facility_id == facility_id and not p.tentative and not p.merged_into}
+
     def roster(self, facility_id: str) -> dict[str, str]:
         """Closed roster of a facility: identity key -> that facility's person_id.
 

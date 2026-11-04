@@ -11,6 +11,7 @@
   quality-report     which face-quality measures predict a reliable match (on human labels)
   inspect            every measure, reference status and face score of given sightings
   doctor             check GPU, ONNX Runtime providers, torch, and (optionally) load a model set
+  run                production run for facility-days against the backend's /worker API (Phase B)
 """
 
 from __future__ import annotations
@@ -204,12 +205,69 @@ def cmd_shadow(args) -> None:
     for name in ("window_days", "ref_q_min", "max_refs", "ref_min_norm", "ref_two_face_ratio"):
         if getattr(args, name) is not None:
             policy = replace(policy, **{name: getattr(args, name)})
+    if args.roster_only_refs:
+        policy = replace(policy, roster_only=True)
     ws = Workspace(ex, args.emb, face_id, body_id, quality)
     days = args.days.split(",") if args.days else ex.days(args.facility)
     cutoff = "run" if args.labels_until == "run" else None
     for day in days:
         shadow_run(ws, args.facility, day, th, args.out, policy=policy, label_cutoff_ms=cutoff,
                    model_name=args.setup or "")
+
+
+def _point(path: str) -> tuple[Thresholds, QualityPolicy, RefPolicy]:
+    pt = json.loads(Path(path).read_text(encoding="utf-8"))
+    return (strict_replace(Thresholds(), pt["thresholds"], "Thresholds"),
+            strict_replace(QualityPolicy(), pt.get("quality", {}), "QualityPolicy"),
+            strict_replace(RefPolicy(include_same_day=True), pt.get("ref_policy", {}), "RefPolicy"))
+
+
+def _run_days(args) -> list[str]:
+    from datetime import date, datetime, timedelta
+    from zoneinfo import ZoneInfo
+    if args.day == "auto":
+        return [(datetime.now(ZoneInfo(args.tz)).date() - timedelta(days=1)).isoformat()]
+    if ".." in args.day:
+        a, b = (date.fromisoformat(x) for x in args.day.split(".."))
+        if b < a:
+            raise SystemExit("--day A..B needs A <= B")
+        return [(a + timedelta(days=i)).isoformat() for i in range((b - a).days + 1)]
+    return [date.fromisoformat(args.day).isoformat()]
+
+
+def cmd_run(args) -> None:
+    from .api import BackendClient, BackendError
+    from .crops import CropStore
+    from .run import Guards, run_night
+    token = Path(args.token_file).read_text(encoding="utf-8").strip()
+    if not token:
+        raise SystemExit(f"{args.token_file} is empty (it must hold the worker token)")
+    th, quality, policy = _point(args.point)
+    if args.max_refs is not None:
+        policy = replace(policy, max_refs=args.max_refs)
+    if args.window_days is not None:
+        policy = replace(policy, window_days=args.window_days)
+    models = face_id = body_id = None
+    if args.models:
+        from .models import load_model_set
+        models = load_model_set(args.models)
+    else:
+        face_id = _ids_from_cache(args.emb, "face", args.face_model)
+        body_id = _ids_from_cache(args.emb, "body", args.body_model)
+    client = BackendClient(args.backend, token)
+    store = CropStore(args.lan_crops, args.cdn_cache)
+    failed = []
+    for day in _run_days(args):
+        try:
+            run_night(client, int(args.facility), day, th=th, quality=quality, policy=policy, emb_root=args.emb,
+                      out_dir=args.out, models=models, face_id=face_id, body_id=body_id, store=store,
+                      tz_name=args.tz, dry_run=args.dry_run, activate=args.activate,
+                      guards=Guards(max_promote_share=args.max_promote_share), keep_crops=args.keep_crops)
+        except (BackendError, OSError, ValueError) as e:
+            print(f"[run] {args.facility} {day}: FAILED: {e}", file=sys.stderr)
+            failed.append(day)
+    if failed:
+        raise SystemExit(f"[run] failed day(s): {', '.join(failed)}")
 
 
 def cmd_adj_sample(args) -> None:
@@ -431,9 +489,36 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--labels-until", choices=["run", "all"], default="run",
                     help="run (default): only labels that existed at that night's run; all: every label in the "
                          "export (debugging only - it leaks the future)")
+    sp.add_argument("--roster-only-refs", action="store_true",
+                    help="use only labels whose person (merges followed, alias file ignored) is on this facility's "
+                         "own roster - the rule production's references/pull applies")
     sp.add_argument("--setup")
     sp.add_argument("--out", required=True)
     sp.set_defaults(fn=cmd_shadow)
+
+    sp = sub.add_parser("run", help="production run against the backend's /worker API (Phase B)")
+    sp.add_argument("--backend", required=True, help="device backend base URL, e.g. https://host/api")
+    sp.add_argument("--token-file", required=True,
+                    help="file holding the worker token (mode 600); never pass the token on the command line")
+    sp.add_argument("--facility", required=True)
+    sp.add_argument("--day", default="auto", help="auto (yesterday, facility time), YYYY-MM-DD, or A..B")
+    sp.add_argument("--tz", default="Asia/Shanghai", help="the facility's time zone; the backend's must match")
+    sp.add_argument("--point", required=True, help="operating point JSON (thresholds, quality, reference policy)")
+    sp.add_argument("--models", help="model config JSON; embeds what the cache lacks (omit to use the cache only)")
+    sp.add_argument("--face-model", help="cached face model (without --models)")
+    sp.add_argument("--body-model", help="cached body model (without --models)")
+    sp.add_argument("--emb", required=True, help="embedding cache root")
+    sp.add_argument("--cdn-cache", required=True, help="where crops are downloaded for the run (deleted afterwards)")
+    sp.add_argument("--lan-crops", help="LAN crop copies from the test boards")
+    sp.add_argument("--out", required=True, help="folder for the run's local CSV/JSON")
+    sp.add_argument("--max-refs", type=int)
+    sp.add_argument("--window-days", type=int)
+    sp.add_argument("--dry-run", action="store_true",
+                    help="pull and decide, write the local files, register and push nothing")
+    sp.add_argument("--activate", action="store_true", help="activate the run when its guards pass (admin token)")
+    sp.add_argument("--max-promote-share", type=float, help="guard: promotions / sightings above this refuse activation")
+    sp.add_argument("--keep-crops", action="store_true", help="keep the downloaded crops (debugging)")
+    sp.set_defaults(fn=cmd_run)
 
     sp = sub.add_parser("adjudicate-sample")
     common(sp, emb=False)

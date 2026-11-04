@@ -50,6 +50,10 @@ class RefPolicy:
     ref_min_norm: float = 0.0  # reference faces need at least this raw feature norm (0 = off)
     ref_two_face_ratio: float | None = None  # skip reference crops with a second face this large (None = off)
     ref_two_face_det: float = 0.6
+    # Only labels whose person (merge chain followed, no alias file) is on the probe facility's own
+    # roster. Production's references/pull applies this rule (machine_labels.md §3): without it the
+    # same human registered at a sibling campus under another id competes with themselves.
+    roster_only: bool = False
 
 
 class Workspace:
@@ -101,14 +105,18 @@ class Workspace:
     def references(self, facilities: list[str], probe_day: str, *, label_cutoff_ms: int | None,
                    policy: RefPolicy = RefPolicy(), exclude_keys: set[str] | None = None,
                    exclude_days: set[str] | None = None, allow_after: bool = False,
-                   label_filter: Callable[[Sighting], bool] | None = None) -> Refs:
+                   label_filter: Callable[[Sighting], bool] | None = None,
+                   roster_ids: set[str] | None = None) -> Refs:
         """Face reference vectors per identity key.
 
         - Labels: human ``known`` only, ``corrected_ts < label_cutoff_ms`` when given.
         - Sightings captured on days ``< probe_day`` (``<=`` with ``include_same_day``),
           within ``window_days``; ``allow_after`` lifts the upper bound (leave-one-day-out).
         - ``exclude_keys``: people removed (leave-one-person-out). ``exclude_days``: days removed.
+        - ``policy.roster_only``: only labels whose folded person is in ``roster_ids`` (required then).
         """
+        if policy.roster_only and roster_ids is None:
+            raise ValueError("RefPolicy.roster_only needs roster_ids (the probe facility's registered ids)")
         exclude_keys = exclude_keys or set()
         exclude_days = exclude_days or set()
         pd = date.fromisoformat(probe_day)
@@ -126,6 +134,8 @@ class Workspace:
                 if s.day > probe_day or (s.day == probe_day and not policy.include_same_day):
                     continue
             if label_filter is not None and not label_filter(s):
+                continue
+            if policy.roster_only and self.export.fold(s.human_person_id) not in roster_ids:
                 continue
             k = self.export.key(s.human_person_id)
             if k is None or k in exclude_keys:

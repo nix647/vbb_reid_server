@@ -1,8 +1,10 @@
 # vbb-reid-server
 
-Server-side re-verification of VBB person sightings ("machine labels"), Phase A:
-offline evaluation, shadow runs and adjudication on a GPU host. Nothing here
-writes to any backend. Plan: `PLAN_nightly_machine_labels.md` (owner-approved 2026-11-03).
+Server-side re-verification of VBB person sightings ("machine labels").
+Phase A (passed on facility 3, 2026-11-05): offline evaluation, shadow runs and adjudication on a
+GPU host. Phase B (0.2.0): `run`, the nightly job against the device backend's `/worker/*` API
+(`vbb_contracts/machine_labels.md` §3); the backend side is not built yet, so `run` is tested
+against an in-memory backend only. Plan: `PLAN_nightly_machine_labels.md` (owner-approved 2026-11-03).
 
 Separate from the board package `vbb-reid` on purpose: that one ships to boards
 with `--no-deps`, an explicit package list and RKNN extractors, and boards rsync
@@ -15,6 +17,8 @@ export CSVs ──┐
 CDN crops ────┼─► embed ─► embedding cache ─► eval ─────► curve.csv, report.md
 LAN crops ────┘   (GPU)    (per model)        shadow ───► labels_*.csv, run_*.json
                                               adjudicate ► sample.csv → page.html → answers.csv → score
+
+/worker API ─► run: register → pull → embed → decide (same code as shadow) → push → finish
 ```
 
 - **References** are human-labeled `known` crops only (no self-training).
@@ -90,6 +94,12 @@ Weights licences: InsightFace and WebFace-trained weights are non-commercial res
 only (plan T18). Evaluate; do not ship before the licence question is settled.
 
 ## Not verified yet
+
+- `run` has never talked to a real backend (`/worker/*` is not built). Its client, export mapping,
+  push filter and lifecycle are tested against an in-memory backend (`tests/test_v020.py`).
+- Production references follow the backend's rule: only labels of the facility's own roster
+  (`RefPolicy.roster_only`). The Phase A pass used alias-unified ids across facilities; step 6g of
+  `SETUP_gpu-ubun.md` measures the difference on existing answers.
 
 - The SCRFD decoder and the ONNX adapters have not run against real weights (no GPU or
   weights in the authoring environment). First run on gpu-ubun: `embed` one day and check
