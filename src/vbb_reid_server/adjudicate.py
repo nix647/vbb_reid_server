@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .data import Export, Sighting
 from .decide import MachineLabel
-from .metrics import Tally, bootstrap_precision
+from .metrics import Tally, bootstrap_precision, cp_lower
 
 
 def stratum(s: Sighting) -> str:
@@ -74,28 +74,32 @@ def read_sample(path: Path) -> list[str]:
 
 
 def person_strips(ex: Export, facility: str, per_person: int = 8, seed: int = 1) -> dict[str, list[str]]:
-    """Up to ``per_person`` human-labeled face crops per roster person, spread over days
-    and over the brand's facilities (references are photos, never vectors or scores)."""
+    """Up to ``per_person`` human-labeled crops per roster person, spread over days and over
+    the brand's facilities, board face crops first (references are photos, never vectors or
+    scores). Any labeled crop counts: the server detector may find a face the board did not
+    flag, so a person with only non-face-flagged labels still has references and must still
+    be offered to the adjudicator."""
     rng = random.Random(seed)
     org = ex.facility_org.get(facility)
     facs = set(ex.facility_of_org(org)) if org else {facility}
     roster = ex.roster(facility)
-    by_key: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+    by_key: dict[str, dict[str, list[tuple[int, str]]]] = defaultdict(lambda: defaultdict(list))
     for s in ex.sightings:
-        if s.facility_id in facs and s.human_state == "known" and s.image_url and s.crop_is_face:
+        if s.facility_id in facs and s.human_state == "known" and s.image_url:
             k = ex.key(s.human_person_id)
             if k in roster:
-                by_key[k][s.day].append(s.image_url)
+                by_key[k][s.day].append((0 if s.crop_is_face else 1, s.image_url))
     out: dict[str, list[str]] = {}
     for k in roster:
         days = sorted(by_key.get(k, {}))
-        urls: list[str] = []
         for d in days:
             rng.shuffle(by_key[k][d])
+            by_key[k][d].sort(key=lambda t: t[0], reverse=True)  # pop() takes face crops first
+        urls: list[str] = []
         while len(urls) < per_person and any(by_key[k][d] for d in days):
             for d in days:
                 if by_key[k][d] and len(urls) < per_person:
-                    urls.append(by_key[k][d].pop())
+                    urls.append(by_key[k][d].pop()[1])
         out[k] = urls
     return out
 
@@ -121,7 +125,7 @@ header button{padding:6px 12px}
 </style></head><body>
 <header><b>Adjudication</b><span id="progress"></span>
 <button onclick="exportCsv()">Export CSV</button>
-<span class="meta">Answers are kept in this browser until exported. Keys 1-9 pick a person, s = stranger, x = can't tell, n = next.</span></header>
+<span class="meta">Answers are kept in this browser until exported. Keys 1-9 pick a person, s = stranger, x = can't tell, n = next; keys act on the item you last clicked or answered.</span></header>
 <div class="people" id="people"></div>
 <div id="items"></div>
 <script>
@@ -150,15 +154,17 @@ ITEMS.forEach((it,idx)=>{ const d=document.createElement("div"); d.className="it
   if (prev) { const r=d.querySelector('input[value="'+prev.answer+'"]'); if (r) r.checked=true; d.classList.add("done");
     d.querySelector("[data-note]").value = prev.note || ""; }
   d.addEventListener("change", ev=>{ const sel=d.querySelector("input[type=radio]:checked"); if(!sel) return;
-    answers[it.sighting_id] = {answer: sel.value, note: d.querySelector("[data-note]").value}; d.classList.add("done"); save(); });
+    answers[it.sighting_id] = {answer: sel.value, note: d.querySelector("[data-note]").value}; d.classList.add("done"); save();
+    cur = idx; });
+  d.addEventListener("click", ()=>{ cur = idx; });
 });
 let cur = 0;
 document.addEventListener("keydown", ev=>{ if (ev.target.tagName === "INPUT" && ev.target.type === "text") return;
   const k = ev.key.toLowerCase(); const it = ITEMS[cur]; if (!it) return; let v = null;
   if (/^[1-9]$/.test(k) && PEOPLE[+k-1]) v = PEOPLE[+k-1].key; else if (k==="s") v="stranger"; else if (k==="x") v="cant_tell";
   else if (k==="n") { cur=Math.min(cur+1, ITEMS.length-1); document.getElementById("it"+cur).scrollIntoView({block:"center"}); return; }
-  if (v) { const el=document.querySelector('#it'+cur+' input[value="'+v+'"]'); if (el){ el.checked=true; el.dispatchEvent(new Event("change",{bubbles:true})); }
-    cur=Math.min(cur+1, ITEMS.length-1); document.getElementById("it"+cur).scrollIntoView({block:"center"}); } });
+  if (v) { const at=cur; const el=document.querySelector('#it'+at+' input[value="'+v+'"]'); if (el){ el.checked=true; el.dispatchEvent(new Event("change",{bubbles:true})); }
+    cur=Math.min(at+1, ITEMS.length-1); document.getElementById("it"+cur).scrollIntoView({block:"center"}); } });
 function exportCsv(){ const q=s=>'"'+String(s).replace(/"/g,'""')+'"';
   const lines=["sighting_id,answer,note"].concat(ITEMS.filter(it=>answers[it.sighting_id]).map(it=>
     [it.sighting_id, answers[it.sighting_id].answer, answers[it.sighting_id].note||""].map(q).join(",")));
@@ -226,31 +232,49 @@ def read_answers(path: Path) -> dict[str, str]:
     return out
 
 
+def _field(lab, name):
+    if lab is None:
+        return None
+    return getattr(lab, name) if isinstance(lab, MachineLabel) else lab.get(name)
+
+
 def score(ex: Export, answers: dict[str, str], labels: dict[str, MachineLabel] | dict[str, dict]) -> dict:
-    """Score machine labels (from a shadow labels CSV or MachineLabel objects) on the
-    adjudicated sightings. ``cant_tell`` is excluded and counted."""
+    """Score machine labels (a shadow labels CSV's rows, or MachineLabel objects) on the
+    adjudicated sightings.
+
+    - ``cant_tell`` and ``mixed`` answers are excluded from precision and counted.
+    - Sightings that carry a human label (in the export, or marked ``human_labeled`` by the
+      shadow run) are excluded: production never labels them, and their own label may have
+      been a reference.
+    - The sample is stratified (equal share per board state x face/no-face), so the pooled
+      numbers are reported as is AND re-weighted to the population of unlabeled sightings of
+      the same facility and days (``weighted_precision``, ``weighted_coverage``)."""
     by_id = {s.sighting_id: s for s in ex.sightings}
     total, promote, stranger_fa = Tally(), Tally(), Tally()
     per_day: dict[str, Tally] = {}
     by_stratum: dict[str, Tally] = {}
-    cant = 0
-    mixed = mixed_flagged = 0
+    cant = mixed = mixed_flagged = excluded = 0
+    days: set[str] = set()
+    facs: set[str] = set()
     for sid, ans in answers.items():
         s = by_id.get(sid)
         if s is None:
             continue
+        lab = labels.get(sid)
+        if s.human_labeled or str(_field(lab, "human_labeled") or "0") in ("1", "True", "true"):
+            excluded += 1
+            continue
+        days.add(s.day)
+        facs.add(s.facility_id)
         if ans == "cant_tell":
             cant += 1
             continue
-        lab = labels.get(sid)
         if ans == "mixed":
             mixed += 1
-            rel = (lab.relation if isinstance(lab, MachineLabel) else lab.get("relation")) if lab else None
-            if rel == "mixed":
+            if _field(lab, "relation") == "mixed":
                 mixed_flagged += 1
             continue
-        state = (lab.state if isinstance(lab, MachineLabel) else lab["state"]) if lab else None
-        key = (lab.person_key if isinstance(lab, MachineLabel) else lab["person_key"]) if lab else None
+        state, key = _field(lab, "state"), _field(lab, "person_key")
         if lab is None:
             o = "abstain"
         elif state != "known":
@@ -266,13 +290,29 @@ def score(ex: Export, answers: dict[str, str], labels: dict[str, MachineLabel] |
             promote.add(o, sid)
         if ans == "stranger":
             stranger_fa.add("wrong" if o == "wrong" else "abstain", sid)
+    # population weights: unlabeled sightings with a crop, same facility and days as the sample
+    pop: dict[str, int] = {}
+    for s in ex.sightings:
+        if s.facility_id in facs and s.day in days and s.human_state is None and s.image_url:
+            pop[stratum(s)] = pop.get(stratum(s), 0) + 1
+    wc = wl = wn = 0.0
+    for st, t in by_stratum.items():
+        w = pop.get(st, 0) / t.n if t.n else 0.0
+        wc += w * t.correct
+        wl += w * t.labeled
+        wn += w * t.n
     return {
-        "adjudicated": len(answers), "cant_tell": cant, "mixed_noted": mixed, "mixed_flagged_by_machine": mixed_flagged,
+        "adjudicated": len(answers), "excluded_human_labeled": excluded, "cant_tell": cant,
+        "mixed_noted": mixed, "mixed_flagged_by_machine": mixed_flagged,
         "precision": total.precision, "coverage": total.coverage, "correct": total.correct,
         "wrong": total.wrong, "flagged": total.flagged, "abstain": total.abstain,
+        "precision_cp_lo": cp_lower(total.correct, total.labeled),
         "precision_lo95_days": bootstrap_precision(per_day),
+        "weighted_precision": (wc / wl) if wl else None, "weighted_coverage": (wl / wn) if wn else None,
         "promote_precision": promote.precision, "promote_coverage": promote.coverage, "promote_n": promote.n,
+        "promote_cp_lo": cp_lower(promote.correct, promote.labeled),
         "strangers": stranger_fa.n, "stranger_false_accepts": stranger_fa.wrong,
-        "by_stratum": {k: {"n": t.n, "precision": t.precision, "coverage": t.coverage} for k, t in sorted(by_stratum.items())},
+        "by_stratum": {k: {"n": t.n, "population": pop.get(k, 0), "precision": t.precision, "coverage": t.coverage}
+                       for k, t in sorted(by_stratum.items())},
         "wrong_ids": total.wrong_ids,
     }

@@ -56,6 +56,9 @@ class QualityPolicy:
             return cls()
         spec = json.loads(Path(path).read_text(encoding="utf-8"))
         known = {f.name for f in fields(cls)}
+        unknown = sorted(k for k in spec if k not in known and not k.startswith("_"))
+        if unknown:
+            raise ValueError(f"unknown QualityPolicy key(s): {', '.join(unknown)}; known: {', '.join(sorted(known))}")
         return replace(cls(), **{k: v for k, v in spec.items() if k in known})
 
 

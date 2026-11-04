@@ -26,8 +26,11 @@ LAN crops ────┘   (GPU)    (per model)        shadow ───► labe
   with a board `known` is a `flag/relabel` in v1.
 - **Evaluation** (`evaluate.py`): per facility and day; `temporal` references (labels that
   existed at the nightly run) and `lodo` (leave one day out, for comparing models);
-  leave-one-person-out false accepts; precision bootstrapped over days because labels
-  come in bulk sessions.
+  leave-one-person-out false accepts. The gate is on promotions (what v1 shows): a minimum
+  number of labels, precision above the target on BOTH a day bootstrap (labels come in bulk
+  sessions) and an exact binomial lower bound, and a measured false-accept upper bound. The
+  chosen point is scored on the data that chose it (optimistic); the independent check is
+  the adjudication set.
 - **Adjudication** (`adjudicate.py`): stratified sample (board state × face/no-face, spread
   over days, never already-labeled sightings) and a self-contained HTML page with a photo
   strip per person, no scores, answers kept in the browser and exported as CSV.
@@ -64,9 +67,10 @@ vbb-reid-server adjudicate-sample --export $W/export --aliases $W/aliases.csv --
 vbb-reid-server adjudicate-page   --export $W/export --aliases $W/aliases.csv --facility 3 \
   --sample $W/adj/sample_f3.csv --lan-crops $W/crops --out $W/adj/page_f3.html
 
-# 6. shadow labels for the chosen operating point, then score against the answers
+# 6. shadow labels for the chosen operating point (eval wrote point_<facility>_<mode>.json; shadow
+#    uses only labels that existed at each night's run), then score against the answers
 vbb-reid-server shadow --export $W/export --aliases $W/aliases.csv --emb $W/emb --facility 3 \
-  --face-model w600k --body-model siglip2 --thresholds $W/out/<candidate>/point.json --out $W/out/shadow
+  --face-model w600k --body-model siglip2 --point $W/out/<candidate>/point_3_temporal.json --out $W/out/shadow
 vbb-reid-server adjudicate-score --export $W/export --aliases $W/aliases.csv \
   --answers ~/Downloads/adjudication_sample_f3.csv --labels $W/out/shadow/labels_3_*.csv
 

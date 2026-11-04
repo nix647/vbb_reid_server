@@ -37,9 +37,16 @@ def test_pose_size_and_blur_still_bite():
 
 def test_policy_from_file(tmp_path):
     p = tmp_path / "q.json"
-    p.write_text(json.dumps({"use_pose": False, "size_floor_px": 20, "not_a_field": 1}))
+    p.write_text(json.dumps({"use_pose": False, "size_floor_px": 20, "_comment": "ok"}))
     pol = QualityPolicy.from_file(p)
     assert pol.use_pose is False and pol.size_floor_px == 20
+    p.write_text(json.dumps({"use_pos": False}))  # a typo must not silently mean "default"
+    try:
+        QualityPolicy.from_file(p)
+    except ValueError as e:
+        assert "use_pos" in str(e)
+    else:
+        raise AssertionError("unknown key accepted")
 
 
 def test_a_0_1_0_cache_is_refused_on_read(tmp_path):
@@ -50,7 +57,7 @@ def test_a_0_1_0_cache_is_refused_on_read(tmp_path):
     try:
         load_face(tmp_path, FACE_ID, "3", "2026-10-20")
     except StaleCache as e:
-        assert "--refresh" in str(e)
+        assert "re-embeds" in str(e)
     else:
         raise AssertionError("a schema-1 cache must not be read with a stored qf")
 

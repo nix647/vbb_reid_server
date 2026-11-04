@@ -26,7 +26,8 @@ class HFVisionEmbedder:
         self.processor = AutoImageProcessor.from_pretrained(repo, revision=revision)
         self.model = AutoModel.from_pretrained(repo, revision=revision, torch_dtype=self.dtype).to(self.device).eval()
         rev = revision or getattr(self.model.config, "_commit_hash", None) or "main"
-        self.model_id = f"hf:{repo}@{str(rev)[:12]}:{pooling}" + (":pad" if pad_square else "")
+        self.model_id = f"hf:{repo}@{str(rev)[:12]}:{pooling}:{dtype if self.device == 'cuda' else 'float32'}" \
+            + (":pad" if pad_square else "")
         self.pooling = pooling
         self.pad_square = pad_square
         self.batch = batch
@@ -48,8 +49,15 @@ class HFVisionEmbedder:
         if self.pooling in ("auto", "pooler") and getattr(out, "pooler_output", None) is not None:
             return out.pooler_output
         hs = out.last_hidden_state
+        cfg = getattr(m.config, "vision_config", m.config)
+        has_cls = "siglip" not in str(getattr(cfg, "model_type", "")).lower()  # SigLIP has no CLS token
         if self.pooling == "mean":
-            return hs[:, 1:].mean(dim=1)
+            if not has_cls:
+                return hs.mean(dim=1)
+            skip = 1 + int(getattr(cfg, "num_register_tokens", 0) or 0)  # CLS + DINOv2/v3 registers
+            return hs[:, skip:].mean(dim=1)
+        if not has_cls:
+            raise ValueError(f"pooling={self.pooling!r} needs a CLS token; {self.repo} has none - use image_features or mean")
         return hs[:, 0]
 
     def embed(self, crops_bgr: list[np.ndarray]) -> np.ndarray:

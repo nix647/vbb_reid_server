@@ -51,9 +51,14 @@ echo 'export HF_HOME=/vmdata/vbb_eval/hf' >> ~/.bashrc && export HF_HOME=/vmdata
 cd ~/vbb_reid_server && pytest -q && vbb-reid-server doctor
 ```
 
-Expected: `39 passed` (0.1.1); `onnxruntime ... providers [...'CUDAExecutionProvider'...]`;
+Expected: `56 passed` (0.1.2); `onnxruntime ... providers [...'CUDAExecutionProvider'...]`;
 `torch ... cuda available=True, device NVIDIA GeForce RTX 4070 Ti SUPER`.
-If `CUDAExecutionProvider` is missing, run `pip install 'onnxruntime-gpu[cuda,cudnn]'` and check again.
+If `CUDAExecutionProvider` is missing, the CPU build may have been installed next to the GPU build
+(0.1.0/0.1.1's `dev` extra pulled it in; both provide the same module). Fix and check again:
+
+```bash
+pip uninstall -y onnxruntime onnxruntime-gpu && pip install 'onnxruntime-gpu[cuda,cudnn]' && vbb-reid-server doctor
+```
 
 ### Proxy: keep the CDN direct
 
@@ -162,7 +167,7 @@ has ~58 % face crops), few `unreadable`, `cdn_failed` near zero, and the time pe
 Do not run the full embed until I have checked that output: if the detector decoding or the colour
 order is wrong, every embedding would have to be recomputed.
 
-## 6b. Settle face quality before the full run (0.1.1)
+## 6b. Settle face quality before the full run (0.1.2)
 
 0.1.0 penalised the alignment residual itself and zeroed most non-frontal faces (found on
 2026-10-16: 54 % of faces had residual >= 6). 0.1.1 stores the raw measurements in the cache
@@ -172,8 +177,9 @@ and computes `qf` when it is read, so the quality policy can change without re-e
 cd ~/vbb_reid_server && git pull && pip install -e '.[onnx,hf,dev]' && pytest -q
 ```
 
-Re-embed the test day once (crops are cached, so only the GPU work repeats; a 0.1.0 day is
-also re-embedded automatically):
+Re-embed the test day once (crops are cached, so only the GPU work repeats). The cache format
+changed twice since your first run (raw quality measures; preprocessing settings now part of the
+model id), so this creates a new cache folder; the old one can be deleted:
 
 ```bash
 vbb-reid-server embed --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv \
@@ -193,7 +199,7 @@ Measure which quality measures matter, on your labels:
 
 ```bash
 vbb-reid-server quality-report --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv \
-  --emb /vmdata/vbb_eval/emb --face-model w600k --facility 3 --days 2026-10-16 \
+  --emb /vmdata/vbb_eval/emb --face-model RGB:m127.5 --facility 3 --days 2026-10-16 \
   --out /vmdata/vbb_eval/out/quality_2026-10-16.csv
 ```
 
@@ -207,4 +213,10 @@ the 1-in-1000 impostor score). From it we set the quality policy (a small JSON p
 - full embed of facilities 2 and 3 (face), ~2 h at the measured rate (estimate);
 - `eval` → curves and operating point, sweeping the quality cutoff too;
 - body candidate (SigLIP2) embed and `eval` with body linking;
-- `shadow` on facility 3 and `adjudicate-score` against `adjudication_f3_set1.csv`.
+- `shadow --point point_3_temporal.json` on facility 3 (uses only labels that existed at each
+  night's run) and `adjudicate-score` against `adjudication_f3_set1.csv` (excludes sightings that
+  carry a human label; reports pooled and population-weighted precision).
+
+`--face-model` / `--body-model` take a cache slug or a substring of the model id that matches
+exactly one cached model; ambiguous names are refused. `vbb-reid-server doctor --models <cfg>`
+prints the exact ids.

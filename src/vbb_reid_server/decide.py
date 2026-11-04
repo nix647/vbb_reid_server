@@ -87,11 +87,22 @@ def _topk_mean(sims: np.ndarray, k: int) -> np.ndarray:
     return part.mean(axis=1)
 
 
+def _starts_of(refs, p: str) -> np.ndarray:
+    starts = getattr(refs, "starts", None)
+    if starts is not None and p in starts:
+        return starts[p]
+    return np.arange(refs[p].shape[0])  # a plain dict: every row is its own sighting
+
+
 def face_scores(probe_faces: dict[str, list[tuple[int, np.ndarray, float, float]]],
-                refs: dict[str, np.ndarray], th: Thresholds) -> FaceScores:
-    """probe_faces: sid -> [(crop_idx, unit vec, qf, face_h)]; refs: key -> (R, D) unit vecs."""
+                refs, th: Thresholds) -> FaceScores:
+    """probe_faces: sid -> [(crop_idx, unit vec, qf, face_h)]; refs: key -> (R, D) unit vecs,
+    optionally a ``pipeline.Refs`` grouping rows by labeled sighting. A probe crop's score for
+    a person is the mean of its top-k matches over that person's labeled SIGHTINGS (each
+    sighting contributes its best crop), so near-duplicate crops of one track count once."""
     persons = sorted(refs)
-    n_refs = np.array([refs[p].shape[0] for p in persons], dtype=int)
+    starts = {p: _starts_of(refs, p) for p in persons}
+    n_refs = np.array([len(starts[p]) for p in persons], dtype=int)  # labeled sightings, not crops
     score: dict[str, np.ndarray] = {}
     crop_best: dict[str, list[tuple[int, float, int]]] = {}
     crop_vecs: dict[str, list[np.ndarray]] = {}
@@ -102,8 +113,15 @@ def face_scores(probe_faces: dict[str, list[tuple[int, np.ndarray, float, float]
         if not usable or not persons:
             continue
         V = np.stack([v for _, v, _ in usable])
-        per = np.stack([_topk_mean(V @ refs[p].T, th.topk) for p in persons], axis=1)  # (C, P)
-        w = np.array([q for _, _, q in usable])
+        cols = []
+        for p in persons:
+            sims = V @ refs[p].T
+            per_sighting = np.maximum.reduceat(sims, starts[p], axis=1) if sims.shape[1] else sims
+            cols.append(_topk_mean(per_sighting, th.topk))
+        per = np.stack(cols, axis=1)  # (C, P)
+        w = np.array([q for _, _, q in usable], dtype=float)
+        if not np.isfinite(w).all() or w.sum() <= 0:
+            w = np.ones(len(usable))
         score[sid] = (per * w[:, None]).sum(0) / w.sum()
         crop_best[sid] = [(c, float(per[i].max()), int(per[i].argmax())) for i, (c, _, _) in enumerate(usable)]
         crop_vecs[sid] = [v for _, v, _ in usable]
@@ -122,6 +140,17 @@ def _face_decision(fs: FaceScores, sid: str, th: Thresholds, extra: float = 0.0)
     if top >= th.face_sim + extra and margin >= th.face_margin and fs.n_refs[best] >= th.min_refs:
         return fs.persons[best], top, margin
     return None
+
+
+def _face_opinion(fs: FaceScores, sid: str, th: Thresholds) -> tuple[str, float] | None:
+    """The sighting's own best face match when it clears the similarity floor, whatever the
+    margin, roster or reference count: a face that clearly points somewhere vetoes a body
+    label for someone else."""
+    s = fs.score.get(sid)
+    if s is None or s.shape[0] == 0:
+        return None
+    b = int(np.argmax(s))
+    return (fs.persons[b], float(s[b])) if s[b] >= th.face_sim else None
 
 
 def _is_mixed(fs: FaceScores, sid: str, th: Thresholds, body_crops: list[np.ndarray] | None):
@@ -160,8 +189,34 @@ def _cannot_link(sightings: list[Sighting]) -> np.ndarray:
     return cl
 
 
+@dataclass
+class BodyIndex:
+    """A day's body similarity and cannot-link matrices, built once and sliced per call
+    (evaluation runs the decision many times per day)."""
+    sids: list[str]
+    pos: dict[str, int]
+    S: np.ndarray
+    cl: np.ndarray
+
+    @classmethod
+    def build(cls, sightings: list[Sighting], body: dict[str, np.ndarray]) -> "BodyIndex":
+        nodes = [s for s in sightings if s.sighting_id in body]
+        sids = [s.sighting_id for s in nodes]
+        if not nodes:
+            return cls([], {}, np.zeros((0, 0)), np.zeros((0, 0), dtype=bool))
+        B = np.stack([body[s] for s in sids]).astype(np.float32)
+        return cls(sids, {sid: i for i, sid in enumerate(sids)}, B @ B.T, _cannot_link(nodes))
+
+    def sub(self, sids: list[str]) -> tuple[np.ndarray, np.ndarray]:
+        if sids == self.sids:
+            return self.S, self.cl
+        idx = np.array([self.pos[s] for s in sids], dtype=int)
+        return self.S[np.ix_(idx, idx)], self.cl[np.ix_(idx, idx)]
+
+
 def body_clusters(sightings: list[Sighting], body: dict[str, np.ndarray], seeds: dict[str, str],
-                  th: Thresholds) -> tuple[dict[str, int], dict[int, str | None], np.ndarray, list[str]]:
+                  th: Thresholds, index: BodyIndex | None = None
+                  ) -> tuple[dict[str, int], dict[int, str | None], np.ndarray, list[str]]:
     """Constrained average-guarded linking. Returns (sid -> cluster id, cluster id -> person or
     None, similarity matrix, node order). ``seeds``: sid -> identity key that must not mix."""
     nodes = [s for s in sightings if s.sighting_id in body]
@@ -169,9 +224,9 @@ def body_clusters(sightings: list[Sighting], body: dict[str, np.ndarray], seeds:
     n = len(nodes)
     if n == 0:
         return {}, {}, np.zeros((0, 0)), []
-    B = np.stack([body[s] for s in sids])
-    S = B @ B.T
-    cl = _cannot_link(nodes)
+    if index is None:
+        index = BodyIndex.build(nodes, body)
+    S, cl = index.sub(sids)
     parent = list(range(n))
     members: dict[int, list[int]] = {i: [i] for i in range(n)}
     mask: dict[int, np.ndarray] = {}
@@ -248,7 +303,9 @@ def body_clusters(sightings: list[Sighting], body: dict[str, np.ndarray], seeds:
         if person[ra] is None:
             person[ra] = person[rb]
         person.pop(rb, None)
-        rejected = {r for r in rejected if rb not in r}
+        # ra grew: its earlier average-linkage rejections may no longer hold (person and
+        # cannot-link conflicts are re-checked anyway), so forget every pair touching ra or rb.
+        rejected = {r for r in rejected if rb not in r and ra not in r}
     cluster_of = {sids[i]: find(i) for i in range(n)}
     cluster_person = {r: person.get(r) for r in set(cluster_of.values())}
     return cluster_of, cluster_person, S, sids
@@ -257,9 +314,11 @@ def body_clusters(sightings: list[Sighting], body: dict[str, np.ndarray], seeds:
 def decide_day(sightings: list[Sighting], fs: FaceScores, body: dict[str, np.ndarray],
                body_crops: dict[str, list[np.ndarray]], roster: dict[str, str],
                key_of: Callable[[str | None], str | None], th: Thresholds,
-               human_seeds: dict[str, str] | None = None) -> list[MachineLabel]:
+               human_seeds: dict[str, str] | None = None, body_index: BodyIndex | None = None
+               ) -> list[MachineLabel]:
     """One facility-day. ``roster``: identity key -> this facility's person_id (closed roster).
-    ``human_seeds``: same-day human labels (sid -> key) usable as body seeds."""
+    ``human_seeds``: same-day human labels (sid -> key) usable as body seeds.
+    ``body_index``: the day's precomputed body matrices (built here when absent)."""
     out: list[MachineLabel] = []
     face_dec: dict[str, tuple[str, float, float]] = {}
     mixed: dict[str, list[str]] = {}
@@ -286,14 +345,18 @@ def decide_day(sightings: list[Sighting], fs: FaceScores, body: dict[str, np.nda
             if p in roster and sid not in mixed:
                 seeds[sid] = p
         linkable = [s for s in sightings if s.sighting_id not in mixed]
-        cluster_of, cluster_person, S, order = body_clusters(linkable, body, seeds, th)
+        if body_index is None:
+            body_index = BodyIndex.build(sightings, body)
+        cluster_of, cluster_person, S, order = body_clusters(linkable, body, seeds, th, body_index)
         idx = {sid: i for i, sid in enumerate(order)}
         seed_members: dict[int, list[int]] = {}
+        cluster_size: dict[int, int] = {}
         for sid, c in cluster_of.items():
+            cluster_size[c] = cluster_size.get(c, 0) + 1
             if sid in seeds:
                 seed_members.setdefault(c, []).append(idx[sid])
     else:
-        seeds, idx, seed_members = {}, {}, {}
+        seeds, idx, seed_members, cluster_size = {}, {}, {}, {}
 
     for s in sightings:
         sid = s.sighting_id
@@ -320,9 +383,14 @@ def decide_day(sightings: list[Sighting], fs: FaceScores, body: dict[str, np.nda
             if cp is not None and len(sm) >= th.min_seeds and cp in roster:
                 best = float(S[idx[sid], sm].max())
                 if best >= th.body_assign:
+                    own = _face_opinion(fs, sid, th)
+                    if own is not None and own[0] != cp:
+                        out.append(MachineLabel(sid, "flag", "conflict", cp, roster.get(cp), "conflict", best,
+                                                None, own[1], best, {"own_face": own[0], "cluster_person": cp}))
+                        continue
                     person, via, conf, bsim = cp, "body", best, best
                     ev["cluster_seeds"] = len(sm)
-                    ev["cluster_size"] = sum(1 for v in cluster_of.values() if v == c)
+                    ev["cluster_size"] = cluster_size.get(c, 0)
         if person is None:
             continue
         if board_key == person:

@@ -28,13 +28,21 @@ from .pipeline import RefPolicy, Workspace
 from .quality import QualityPolicy
 
 
+def strict_replace(obj, spec: dict, what: str):
+    """dataclasses.replace that refuses unknown keys (a typo must not silently mean 'default').
+    Keys starting with '_' are comments."""
+    known = {f.name for f in fields(obj)}
+    unknown = sorted(k for k in spec if k not in known and not k.startswith("_"))
+    if unknown:
+        raise SystemExit(f"unknown {what} key(s): {', '.join(unknown)}; known: {', '.join(sorted(known))}")
+    return replace(obj, **{k: v for k, v in spec.items() if k in known})
+
+
 def _thresholds(args) -> Thresholds:
-    th = Thresholds()
-    if getattr(args, "thresholds", None):
-        spec = json.loads(Path(args.thresholds).read_text(encoding="utf-8"))
-        known = {f.name for f in fields(Thresholds)}
-        th = replace(th, **{k: v for k, v in spec.items() if k in known})
-    return th
+    if not getattr(args, "thresholds", None):
+        return Thresholds()
+    spec = json.loads(Path(args.thresholds).read_text(encoding="utf-8"))
+    return strict_replace(Thresholds(), spec, "Thresholds")
 
 
 def _ids(models_cfg: str | None):
@@ -47,15 +55,22 @@ def _ids(models_cfg: str | None):
 
 
 def _ids_from_cache(emb_root: str, kind: str, name: str | None) -> str | None:
-    """Pick a cached model id by slug or substring (eval/shadow need no GPU)."""
+    """Pick a cached model id (eval/shadow need no GPU): an exact slug or exact id wins;
+    otherwise the substring must match exactly ONE cached model."""
     if not name:
         return None
     base = Path(emb_root) / kind
-    for meta in sorted(base.glob("*/model.json")):
-        mid = json.loads(meta.read_text())["model_id"]
-        if name == meta.parent.name or name in mid:
-            return mid
-    raise SystemExit(f"no cached {kind} model matching {name!r} under {base}")
+    cached = [(meta.parent.name, json.loads(meta.read_text())["model_id"]) for meta in sorted(base.glob("*/model.json"))]
+    exact = [mid for sl, mid in cached if name in (sl, mid)]
+    if exact:
+        return exact[0]
+    hits = [(sl, mid) for sl, mid in cached if name in mid]
+    if len(hits) == 1:
+        return hits[0][1]
+    if not hits:
+        raise SystemExit(f"no cached {kind} model matching {name!r} under {base}")
+    listing = "\n".join(f"  {sl}  {mid}" for sl, mid in hits)
+    raise SystemExit(f"{name!r} matches {len(hits)} cached {kind} models; pass a slug or a longer substring:\n{listing}")
 
 
 def cmd_summary(args) -> None:
@@ -80,19 +95,19 @@ def cmd_embed(args) -> None:
         for day in ex.days(fac):
             if days and day not in days:
                 continue
-            embed_day(ex.by_facility_day(fac, day), store, ms, args.emb, fac, day, face_min_px=args.face_min_px,
-                      refresh=args.refresh)
+            embed_day(ex.by_facility_day(fac, day), store, ms, args.emb, fac, day, refresh=args.refresh)
     print(f"[embed] crop sources: {store.stats}")
     print(f"[embed] face model: {ms.face_id}\n[embed] body model: {ms.body_id}")
 
 
 def cmd_eval(args) -> None:
-    from .evaluate import (curve_rows, evaluate_facility, load_grid, operating_point, per_sighting_wrongs,
-                           summarize, write_curve)
+    from .evaluate import (curve_rows, evaluate_facility, gate_reasons, load_grid, operating_point,
+                           per_sighting_wrongs, summarize, write_curve, write_point)
     ex = load_export(args.export, args.aliases)
     face_id = _ids_from_cache(args.emb, "face", args.face_model)
     body_id = _ids_from_cache(args.emb, "body", args.body_model)
-    ws = Workspace(ex, args.emb, face_id, body_id, QualityPolicy.from_file(args.quality))
+    quality = QualityPolicy.from_file(args.quality)
+    ws = Workspace(ex, args.emb, face_id, body_id, quality)
     base = _thresholds(args)
     policy = RefPolicy(window_days=args.window_days, ref_q_min=args.ref_q_min, max_refs=args.max_refs)
     grid = load_grid(args.grid)
@@ -106,14 +121,23 @@ def cmd_eval(args) -> None:
                                         loo=not args.no_loo)
             rows = curve_rows(results, setup, mode, fac)
             write_curve(rows, out / "curve.csv")
-            point = operating_point(rows, args.min_precision_lo, args.max_loo_fa)
+            gate = dict(min_precision_lo=args.min_precision_lo, max_loo_fa=args.max_loo_fa,
+                        min_labeled=args.min_labeled, gate=args.gate)
+            point = operating_point(rows, **gate)
             text = summarize(rows, point)
+            if point is None and rows:  # say why the best-covering rows failed
+                best = sorted(rows, key=lambda r: -(float(r["promote_coverage"] or 0)))[:3]
+                text += "\n" + "\n".join(f"  combo {r['combo']}: " + "; ".join(gate_reasons(r, **gate)) for r in best)
             print(f"[eval] facility {fac} refs={mode}\n{text}")
             with (out / "report.md").open("a", encoding="utf-8") as fh:
                 fh.write(f"## {setup} · facility {fac} · refs {mode}\n\n```\n{text}\n```\n")
                 wrongs = per_sighting_wrongs(results, point)
                 if wrongs:
                     fh.write(f"Wrong at the operating point ({len(wrongs)}): {', '.join(wrongs[:50])}\n\n")
+            if point is not None:
+                pth = out / f"point_{fac}_{mode}.json"
+                write_point(point, pth, ref_policy=policy, quality=quality)
+                print(f"[eval] operating point written to {pth}")
 
 
 def cmd_shadow(args) -> None:
@@ -121,11 +145,24 @@ def cmd_shadow(args) -> None:
     ex = load_export(args.export, args.aliases)
     face_id = _ids_from_cache(args.emb, "face", args.face_model)
     body_id = _ids_from_cache(args.emb, "body", args.body_model)
-    ws = Workspace(ex, args.emb, face_id, body_id, QualityPolicy.from_file(args.quality))
-    th = _thresholds(args)
+    th, quality = _thresholds(args), QualityPolicy.from_file(args.quality)
+    policy = RefPolicy(include_same_day=True)
+    if args.point:
+        pt = json.loads(Path(args.point).read_text(encoding="utf-8"))
+        if args.thresholds or args.quality:
+            raise SystemExit("--point already carries thresholds and quality; do not combine it with --thresholds/--quality")
+        th = strict_replace(Thresholds(), pt["thresholds"], "Thresholds")
+        quality = strict_replace(QualityPolicy(), pt.get("quality", {}), "QualityPolicy")
+        policy = strict_replace(policy, pt.get("ref_policy", {}), "RefPolicy")
+    for name in ("window_days", "ref_q_min", "max_refs"):
+        if getattr(args, name) is not None:
+            policy = replace(policy, **{name: getattr(args, name)})
+    ws = Workspace(ex, args.emb, face_id, body_id, quality)
     days = args.days.split(",") if args.days else ex.days(args.facility)
+    cutoff = "run" if args.labels_until == "run" else None
     for day in days:
-        shadow_run(ws, args.facility, day, th, args.out, model_name=args.setup or "")
+        shadow_run(ws, args.facility, day, th, args.out, policy=policy, label_cutoff_ms=cutoff,
+                   model_name=args.setup or "")
 
 
 def cmd_adj_sample(args) -> None:
@@ -255,7 +292,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--lan-crops", help="root of rsynced board crops (<did>/<day>/<sid>/<idx>.jpg)")
     sp.add_argument("--cdn-cache", help="where CDN crops are cached")
     sp.add_argument("--no-fetch", action="store_true", help="never download; use caches only")
-    sp.add_argument("--face-min-px", type=float, default=12.0)
     sp.add_argument("--refresh", action="store_true", help="re-embed days already in the cache")
     sp.set_defaults(fn=cmd_embed)
 
@@ -272,8 +308,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--window-days", type=int, default=60)
     sp.add_argument("--ref-q-min", type=float, default=0.40)
     sp.add_argument("--max-refs", type=int, default=300)
-    sp.add_argument("--min-precision-lo", type=float, default=0.99)
-    sp.add_argument("--max-loo-fa", type=float, default=0.005)
+    sp.add_argument("--min-precision-lo", type=float, default=0.99,
+                    help="gate: lower bound (day bootstrap AND exact binomial) on precision")
+    sp.add_argument("--max-loo-fa", type=float, default=0.005,
+                    help="gate: upper bound on the leave-one-person-out false-accept rate")
+    sp.add_argument("--min-labeled", type=int, default=50, help="gate: minimum labels the machine gave")
+    sp.add_argument("--gate", choices=["promote", "all"], default="promote",
+                    help="gate on promotions (what v1 shows) or on every labeled target")
     sp.add_argument("--no-loo", action="store_true")
     sp.add_argument("--out", required=True)
     sp.set_defaults(fn=cmd_eval)
@@ -284,8 +325,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--days")
     sp.add_argument("--face-model")
     sp.add_argument("--body-model")
-    sp.add_argument("--thresholds", help="JSON with the chosen operating point")
-    sp.add_argument("--quality", help="JSON QualityPolicy overrides")
+    sp.add_argument("--point", help="point_<facility>_<mode>.json written by eval (thresholds, quality, reference policy)")
+    sp.add_argument("--thresholds", help="JSON with Thresholds (instead of --point)")
+    sp.add_argument("--quality", help="JSON QualityPolicy overrides (instead of --point)")
+    sp.add_argument("--window-days", type=int)
+    sp.add_argument("--ref-q-min", type=float)
+    sp.add_argument("--max-refs", type=int)
+    sp.add_argument("--labels-until", choices=["run", "all"], default="run",
+                    help="run (default): only labels that existed at that night's run; all: every label in the "
+                         "export (debugging only - it leaks the future)")
     sp.add_argument("--setup")
     sp.add_argument("--out", required=True)
     sp.set_defaults(fn=cmd_shadow)

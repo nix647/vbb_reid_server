@@ -22,11 +22,30 @@ from .models.base import l2n
 from .quality import QualityPolicy
 
 
+class Refs(dict):
+    """identity key -> (R, D) reference vectors, grouped by sighting (rows of one sighting are
+    contiguous). ``starts[key]`` holds each sighting's first row, so scoring can take one best
+    match per labeled sighting: three near-identical crops of one track count once, and
+    ``min_refs`` counts sightings, not crops."""
+
+    def __init__(self, vecs: dict[str, np.ndarray] | None = None, starts: dict[str, np.ndarray] | None = None):
+        super().__init__(vecs or {})
+        self.starts: dict[str, np.ndarray] = dict(starts or {})
+        for k, v in self.items():
+            self.starts.setdefault(k, np.arange(v.shape[0]))
+
+    def n_sightings(self, key: str) -> int:
+        return int(len(self.starts[key]))
+
+    def without(self, key: str) -> "Refs":
+        return Refs({k: v for k, v in self.items() if k != key}, {k: v for k, v in self.starts.items() if k != key})
+
+
 @dataclass(frozen=True)
 class RefPolicy:
     window_days: int = 60  # only labels on sightings captured within this many days before the probe day
     ref_q_min: float = 0.40  # reference faces need at least this quality
-    max_refs: int = 300  # most recent per person
+    max_refs: int = 300  # most recent labeled SIGHTINGS per person
     include_same_day: bool = False  # production: True (labels made before the run); eval temporal: False
 
 
@@ -77,7 +96,7 @@ class Workspace:
     def references(self, facilities: list[str], probe_day: str, *, label_cutoff_ms: int | None,
                    policy: RefPolicy = RefPolicy(), exclude_keys: set[str] | None = None,
                    exclude_days: set[str] | None = None, allow_after: bool = False,
-                   label_filter: Callable[[Sighting], bool] | None = None) -> dict[str, np.ndarray]:
+                   label_filter: Callable[[Sighting], bool] | None = None) -> Refs:
         """Face reference vectors per identity key.
 
         - Labels: human ``known`` only, ``corrected_ts < label_cutoff_ms`` when given.
@@ -89,7 +108,7 @@ class Workspace:
         exclude_days = exclude_days or set()
         pd = date.fromisoformat(probe_day)
         lo = (pd - timedelta(days=policy.window_days)).isoformat()
-        rows: dict[str, list[tuple[int, np.ndarray]]] = {}
+        rows: dict[str, list[tuple[int, str, np.ndarray]]] = {}
         wanted: dict[tuple[str, str], list[Sighting]] = {}
         for s in self.export.sightings:
             if s.facility_id not in facilities or s.human_state != "known":
@@ -117,19 +136,36 @@ class Workspace:
             for s in ss:
                 for i in pos.get(s.sighting_id, []):
                     if ft.qf[i] >= policy.ref_q_min:
-                        rows.setdefault(self.export.key(s.human_person_id), []).append((s.capture_ts, ft.vec[i]))
-        out: dict[str, np.ndarray] = {}
+                        rows.setdefault(self.export.key(s.human_person_id), []).append(
+                            (s.capture_ts, s.sighting_id, ft.vec[i]))
+        vecs: dict[str, np.ndarray] = {}
+        starts: dict[str, np.ndarray] = {}
         for k, lst in rows.items():
-            lst.sort(key=lambda t: -t[0])
-            out[k] = np.stack([v for _, v in lst[:policy.max_refs]]).astype(np.float32)
-        return out
+            lst.sort(key=lambda t: (-t[0], t[1]))  # newest sighting first; a sighting's crops stay together
+            keep_sids: list[str] = []
+            for _, sid, _ in lst:
+                if not keep_sids or keep_sids[-1] != sid:
+                    keep_sids.append(sid)
+            keep = set(keep_sids[:policy.max_refs])
+            lst = [t for t in lst if t[1] in keep]
+            vecs[k] = np.stack([v for _, _, v in lst]).astype(np.float32)
+            st, prev = [], None
+            for j, (_, sid, _) in enumerate(lst):
+                if sid != prev:
+                    st.append(j)
+                    prev = sid
+            starts[k] = np.array(st, dtype=int)
+        return Refs(vecs, starts)
 
     def human_seeds(self, facility: str, day: str, label_cutoff_ms: int | None,
                     exclude_keys: set[str] | None = None) -> dict[str, str]:
         exclude_keys = exclude_keys or set()
         out = {}
         for s in self.export.by_facility_day(facility, day):
-            if s.human_state == "known" and (label_cutoff_ms is None or (s.corrected_ts or 0) < label_cutoff_ms):
+            if s.human_state != "known":
+                continue
+            # same rule as references(): a label without a timestamp is not known to predate the run
+            if label_cutoff_ms is None or (s.corrected_ts is not None and s.corrected_ts < label_cutoff_ms):
                 k = self.export.key(s.human_person_id)
                 if k and k not in exclude_keys:
                     out[s.sighting_id] = k

@@ -54,15 +54,16 @@ class SCRFDDetector:
     def __init__(self, path: str | Path, input_size: int = 640, score_thresh: float = 0.5,
                  nms_thresh: float = 0.4, providers: list[str] | None = None):
         self.path = Path(path)
-        self.model_id = file_model_id(self.path)
+        self.model_id = f"{file_model_id(self.path)}:in{int(input_size)}:s{score_thresh:g}:n{nms_thresh:g}"
         self.session = _session(self.path, providers)
         self.input_name = self.session.get_inputs()[0].name
         self.input_size = int(input_size)
         self.score_thresh = score_thresh
         self.nms_thresh = nms_thresh
         n_out = len(self.session.get_outputs())
-        if n_out not in (6, 9):
-            raise ValueError(f"SCRFD export with {n_out} outputs not supported (want 9 with kps)")
+        if n_out != 9:
+            raise ValueError(f"SCRFD export with {n_out} outputs: need the 9-output export with landmarks "
+                             f"(*_bnkps / det_10g.onnx); alignment needs the five keypoints")
         self.fmc = 3
         self.strides = (8, 16, 32)
         self.use_kps = n_out == 9
@@ -126,7 +127,10 @@ class OnnxFaceEmbedder:
     def __init__(self, path: str | Path, color: str = "RGB", mean: float = 127.5, std: float = 127.5,
                  layout: str = "NCHW", flip: bool = False, batch: int = 64, providers: list[str] | None = None):
         self.path = Path(path)
-        self.model_id = file_model_id(self.path) + (":flip" if flip else "")
+        # Every preprocessing choice is part of the id: two colour orders of one weights file
+        # are two models, and must never share a cache.
+        self.model_id = (f"{file_model_id(self.path)}:{color.upper()}:m{float(mean):g}:s{float(std):g}:"
+                         f"{layout.upper()}" + (":flip" if flip else ""))
         self.session = _session(self.path, providers)
         inp = self.session.get_inputs()[0]
         self.input_name = inp.name
@@ -178,7 +182,9 @@ class OnnxBodyEmbedder:
                  std: tuple[float, float, float] = (58.395, 57.12, 57.375),
                  layout: str = "NCHW", flip: bool = False, batch: int = 64, providers: list[str] | None = None):
         self.path = Path(path)
-        self.model_id = file_model_id(self.path) + (":flip" if flip else "")
+        self.model_id = (f"{file_model_id(self.path)}:{int(height)}x{int(width)}:{color.upper()}:"
+                         f"m{','.join(f'{x:g}' for x in mean)}:s{','.join(f'{x:g}' for x in std)}:{layout.upper()}"
+                         + (":flip" if flip else ""))
         self.session = _session(self.path, providers)
         inp = self.session.get_inputs()[0]
         self.input_name = inp.name

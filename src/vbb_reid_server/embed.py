@@ -7,7 +7,9 @@ Cache layout (``--emb`` root):
                                                  detected face). qf is NOT stored: it is computed
                                                  on read from a QualityPolicy, so changing the
                                                  policy never needs a re-embed.
-  <root>/face/<face_slug>/<facility>/<day>.done  sighting_id:crop_idx lines already processed
+                                                 ``processed`` lists every crop the detector
+                                                 has seen ("sid:source:idx"), face or not, so
+                                                 done-ness lives in the same file as the rows.
   <root>/body/<body_slug>/<facility>/<day>.npz   sighting_id, crop_idx, source, vec
   <root>/<kind>/<slug>/model.json                the full model id
 
@@ -19,8 +21,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 import cv2
@@ -36,7 +39,18 @@ def slug(model_id: str) -> str:
     return hashlib.sha256(model_id.encode()).hexdigest()[:16]
 
 
-FACE_SCHEMA = 2  # 1 = 0.1.0 (stored qf); 2 = raw quality measures, qf computed on read
+FACE_SCHEMA = 3  # 1 = 0.1.0 (stored qf); 2 = measures + .done file; 3 = measures + processed in the npz
+EMBED_FACE_MIN_PX = 8.0  # faces below this are not stored; the decision's face_min_px filters further
+
+
+def _key(sid, source, idx) -> str:
+    return f"{sid}:{source}:{int(idx)}"
+
+
+def _atomic_savez(path: Path, **arrays) -> None:
+    tmp = path.with_name(path.name + ".tmp.npz")
+    np.savez(tmp, **arrays)
+    os.replace(tmp, path)
 
 
 class StaleCache(RuntimeError):
@@ -111,11 +125,19 @@ def load_face(root: Path, model_id: str, facility: str, day: str,
     z = np.load(f, allow_pickle=True)
     schema = int(z["schema"]) if "schema" in z.files else 1
     if schema < FACE_SCHEMA:
-        raise StaleCache(f"{f} was written by vbb-reid-server 0.1.0 (stored qf); re-embed that day with "
-                         f"`embed --refresh` (crops are cached, so only the GPU work repeats)")
+        raise StaleCache(f"{f} has cache schema {schema} (current {FACE_SCHEMA}); `embed` re-embeds such a day "
+                         f"automatically (crops are cached, so only the GPU work repeats)")
     t = FaceTable(z["sighting_id"], z["crop_idx"], z["source"], z["vec"], z["face_h"], z["det"], z["blur"],
                   z["residual"], z["asym"], z["yaw"], np.zeros(len(z["sighting_id"])))
     return t.with_policy(policy or QualityPolicy())
+
+
+def load_processed(root: Path, model_id: str, facility: str, day: str) -> set[str]:
+    f = _face_path(root, model_id, facility, day)
+    if not f.exists():
+        return set()
+    z = np.load(f, allow_pickle=True)
+    return set(str(x) for x in z["processed"]) if "processed" in z.files else set()
 
 
 def load_body(root: Path, model_id: str, facility: str, day: str) -> BodyTable:
@@ -145,40 +167,62 @@ def _best_face(dets, img_h: int):
     return best
 
 
+def _drop(table, keep: np.ndarray):
+    return type(table)(*(getattr(table, f.name)[keep] for f in fields(table)))
+
+
 def embed_day(sightings: list[Sighting], store: CropStore, models, emb_root: str | Path,
-              facility: str, day: str, *, face_min_px: float = 12.0, refresh: bool = False,
-              log=print) -> dict[str, int]:
-    """Embed every crop of the given sightings (one facility-day) and merge into the cache."""
+              facility: str, day: str, *, refresh: bool = False, log=print) -> dict[str, int]:
+    """Embed every crop of the given sightings (one facility-day) and merge into the cache.
+
+    Idempotent: a crop already in the cache (face: ``processed``; body: its row) is skipped.
+    A sighting whose LAN crops are now available drops any CDN row it had: the LAN set holds
+    the uploaded best crop too, so keeping both would store one image twice."""
     root = Path(emb_root)
-    stats = {"sightings": len(sightings), "crops": 0, "faces": 0, "bodies": 0, "unreadable": 0}
+    stats = {"sightings": len(sightings), "crops": 0, "faces": 0, "bodies": 0, "unreadable": 0,
+             "replaced_cdn": 0}
     t0 = time.time()
 
     face_id, body_id = models.face_id, models.body_id
-    done: set[str] = set()
+    processed: set[str] = set()
     old_face = FaceTable.empty()
     old_body = BodyTable.empty()
     if face_id:
-        fdir = _dir(root, "face", face_id, facility)
-        done_path = fdir / f"{day}.done"
-        try:
-            old_face = FaceTable.empty() if refresh else load_face(root, face_id, facility, day)
-        except StaleCache:
-            log(f"[embed] facility {facility} {day}: cache from 0.1.0 (stored qf) - re-embedding the day")
-            refresh = True
-            old_face = FaceTable.empty()
-        if done_path.exists() and not refresh:
-            done = set(done_path.read_text().split())
+        _dir(root, "face", face_id, facility)
+        if not refresh:
+            try:
+                old_face = load_face(root, face_id, facility, day)
+                processed = load_processed(root, face_id, facility, day)
+            except StaleCache:
+                log(f"[embed] facility {facility} {day}: older cache schema - re-embedding the day")
+                old_face, processed = FaceTable.empty(), set()
     if body_id:
         _dir(root, "body", body_id, facility)
-        old_body = load_body(root, body_id, facility, day)
-    body_done = {f"{s}:{c}" for s, c in zip(old_body.sighting_id, old_body.crop_idx)}
+        if not refresh:
+            old_body = load_body(root, body_id, facility, day)
+
+    crops_of = {s.sighting_id: store.crops(s) for s in sightings}
+    # LAN supersedes CDN, per sighting
+    lan_sids = {sid for sid, refs in crops_of.items() if refs and refs[0].source == "lan"}
+    if lan_sids:
+        if len(old_face):
+            keep = np.array([not (str(sid) in lan_sids and src == "cdn")
+                             for sid, src in zip(old_face.sighting_id, old_face.source)], dtype=bool)
+            stats["replaced_cdn"] += int((~keep).sum())
+            old_face = _drop(old_face, keep)
+        processed = {k for k in processed if not (k.split(":")[0] in lan_sids and k.split(":")[1] == "cdn")}
+        if len(old_body):
+            keep = np.array([not (str(sid) in lan_sids and src == "cdn")
+                             for sid, src in zip(old_body.sighting_id, old_body.source)], dtype=bool)
+            old_body = _drop(old_body, keep)
+    body_done = {_key(s_, src, c) for s_, src, c in zip(old_body.sighting_id, old_body.source, old_body.crop_idx)}
 
     f_rows, f_imgs = [], []
     b_rows, b_imgs = [], []
     for s in sightings:
-        for ref in store.crops(s):
-            key = f"{s.sighting_id}:{ref.index}"
-            need_face = bool(face_id) and key not in done
+        for ref in crops_of[s.sighting_id]:
+            key = _key(s.sighting_id, ref.source, ref.index)
+            need_face = bool(face_id) and key not in processed
             need_body = bool(body_id) and key not in body_done
             if not (need_face or need_body):
                 continue
@@ -191,9 +235,9 @@ def embed_day(sightings: list[Sighting], store: CropStore, models, emb_root: str
                 b_rows.append((s.sighting_id, ref.index, ref.source))
                 b_imgs.append(img)
             if need_face:
-                done.add(key)
+                processed.add(key)
                 det = _best_face(models.face_detector.detect(img), img.shape[0])
-                if det is None or det.height < face_min_px:
+                if det is None or det.height < EMBED_FACE_MIN_PX:
                     continue
                 aligned, per_point = norm_crop_points(img, det.kps)
                 f_rows.append((s.sighting_id, ref.index, ref.source, det.height, det.score, blur_var(aligned),
@@ -208,24 +252,39 @@ def embed_day(sightings: list[Sighting], store: CropStore, models, emb_root: str
             np.array([r[0] for r in f_rows], dtype=object), np.array([r[1] for r in f_rows], dtype=int),
             np.array([r[2] for r in f_rows], dtype=object), vecs.astype(np.float32),
             col(3), col(4), col(5), col(6), col(7), col(8), np.zeros(len(f_rows)))
-        merged = _concat_face(old_face, new)
+        merged = _dedupe(_concat_face(old_face, new))
         fdir = root / "face" / slug(face_id) / facility
-        np.savez(fdir / f"{day}.npz", schema=np.int64(FACE_SCHEMA), sighting_id=merged.sighting_id,
-                 crop_idx=merged.crop_idx, source=merged.source, vec=merged.vec,
-                 **{m: getattr(merged, m) for m in FaceTable.MEASURES})
-        (fdir / f"{day}.done").write_text("\n".join(sorted(done)))
+        _atomic_savez(fdir / f"{day}.npz", schema=np.int64(FACE_SCHEMA), sighting_id=merged.sighting_id,
+                      crop_idx=merged.crop_idx, source=merged.source, vec=merged.vec,
+                      processed=np.array(sorted(processed), dtype=object),
+                      **{m: getattr(merged, m) for m in FaceTable.MEASURES})
+        stale_done = fdir / f"{day}.done"  # schema 2 leftovers
+        if stale_done.exists():
+            stale_done.unlink()
     if body_id:
         vecs = models.body.embed(b_imgs) if b_imgs else np.zeros((0, old_body.vec.shape[1] if len(old_body) else 0), np.float32)
         stats["bodies"] = len(b_rows)
         new_b = BodyTable(np.array([r[0] for r in b_rows], dtype=object), np.array([r[1] for r in b_rows], dtype=int),
                           np.array([r[2] for r in b_rows], dtype=object), vecs.astype(np.float32))
-        merged_b = _concat_body(old_body, new_b)
+        merged_b = _dedupe(_concat_body(old_body, new_b))
         bdir = root / "body" / slug(body_id) / facility
-        np.savez(bdir / f"{day}.npz", sighting_id=merged_b.sighting_id, crop_idx=merged_b.crop_idx,
-                 source=merged_b.source, vec=merged_b.vec)
+        _atomic_savez(bdir / f"{day}.npz", sighting_id=merged_b.sighting_id, crop_idx=merged_b.crop_idx,
+                      source=merged_b.source, vec=merged_b.vec)
     stats["seconds"] = round(time.time() - t0, 1)
     log(f"[embed] facility {facility} {day}: {stats}")
     return stats
+
+
+def _dedupe(table):
+    """One row per (sighting, source, crop): the last one written wins."""
+    if len(table) == 0:
+        return table
+    seen: dict[str, int] = {}
+    for i, (sid, src, c) in enumerate(zip(table.sighting_id, table.source, table.crop_idx)):
+        seen[_key(sid, src, c)] = i
+    keep = np.zeros(len(table), dtype=bool)
+    keep[list(seen.values())] = True
+    return _drop(table, keep)
 
 
 def _concat_face(a: FaceTable, b: FaceTable) -> FaceTable:
@@ -250,7 +309,7 @@ def prune(emb_root: str | Path, older_than_days: float) -> int:
     root = Path(emb_root)
     cutoff = time.time() - older_than_days * 86400
     n = 0
-    for f in list(root.rglob("*.npz")) + list(root.rglob("*.done")):
+    for f in list(root.rglob("*.npz")) + list(root.rglob("*.done")) + list(root.rglob("*.tmp.npz")):
         if f.stat().st_mtime < cutoff:
             f.unlink()
             n += 1

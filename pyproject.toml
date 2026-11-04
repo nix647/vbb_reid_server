@@ -27,7 +27,10 @@ onnx = ["onnxruntime-gpu>=1.17"]
 onnx-cpu = ["onnxruntime>=1.17"]
 # Hugging Face vision encoders (SigLIP2, DINOv3) for the body/appearance path.
 hf = ["torch>=2.3", "transformers>=4.56", "pillow>=10"]
-dev = ["pytest>=7.0", "onnxruntime>=1.17"]
+# dev never pulls an onnxruntime build itself: the CPU and GPU builds install the same module, and
+# installing both leaves whichever came last (possibly without CUDA). Use .[onnx,dev] on a GPU
+# host, .[onnx-cpu,dev] elsewhere.
+dev = ["pytest>=7.0", "onnx>=1.14"]
 
 [project.scripts]
 vbb-reid-server = "vbb_reid_server.cli:main"

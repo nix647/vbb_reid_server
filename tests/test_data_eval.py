@@ -91,7 +91,10 @@ def test_evaluate_scores_targets_and_counts_leave_one_out_false_accepts(tmp_path
     # With H1 removed, H1's 5 targets must not be named H2: zero false accepts on well-separated people.
     assert r.loo.n == 6 and r.loo.wrong == 0
     rows = curve_rows(res, "synthetic", "temporal", "3")
-    assert operating_point(rows, 0.0, 0.01) is not None
+    # 6 perfect labels are weak evidence: the gate refuses them (min_labeled, binomial bounds)...
+    assert operating_point(rows, 0.9, 0.01) is None
+    # ...and only a gate loose enough to accept that little evidence passes.
+    assert operating_point(rows, 0.0, 1.0, min_labeled=1) is not None
 
 
 def test_leave_one_out_catches_a_lookalike(tmp_path):
@@ -123,8 +126,10 @@ def test_score_counts_stranger_false_accepts_and_skips_cant_tell(tmp_path):
     ex = load_export(exp, tmp_path / "aliases.csv")
     labels = {"unl0": {"state": "known", "person_key": "H1"}, "tA0": {"state": "known", "person_key": "H1"}}
     res = score(ex, {"unl0": "stranger", "tA0": "H1", "tA1": "cant_tell"}, labels)
-    assert res["wrong"] == 1 and res["correct"] == 1 and res["cant_tell"] == 1
-    assert res["stranger_false_accepts"] == 1
+    # tA0 / tA1 carry human labels: excluded, never scored (production would not label them)
+    assert res["excluded_human_labeled"] == 2
+    assert res["wrong"] == 1 and res["correct"] == 0 and res["cant_tell"] == 0
+    assert res["stranger_false_accepts"] == 1 and res["weighted_precision"] == 0.0
 
 
 def test_umeyama_recovers_a_similarity_transform():

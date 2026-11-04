@@ -90,7 +90,7 @@ def write_face_cache(emb: Path, facility: str, day: str, rows: list[tuple[str, i
     ``qf`` exactly for face_h >= 40 (det = qf; blur, residual, asym, yaw neutral)."""
     d = _dir(emb, "face", FACE_ID, facility)
     n = len(rows)
-    np.savez(d / f"{day}.npz", schema=np.int64(2),
+    np.savez(d / f"{day}.npz", schema=np.int64(3), processed=np.array([f"{r[0]}:cdn:{r[1]}" for r in rows], dtype=object),
              sighting_id=np.array([r[0] for r in rows], dtype=object), crop_idx=np.array([r[1] for r in rows]),
              source=np.array(["cdn"] * n, dtype=object),
              vec=np.stack([r[2] for r in rows]).astype(np.float32) if rows else np.zeros((0, D), np.float32),

@@ -5,6 +5,7 @@ also bootstrapped over days, never only per sighting."""
 
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass, field
 
@@ -73,3 +74,42 @@ def bootstrap_precision(per_day: dict[str, Tally], iters: int = 2000, seed: int 
         return None
     vals.sort()
     return vals[max(0, int(q * len(vals)) - 1)]
+
+
+def _binom_cdf(k: int, n: int, p: float) -> float:
+    """P[X <= k], X ~ Binomial(n, p), summed in log space (n up to tens of thousands)."""
+    if p <= 0.0:
+        return 1.0
+    if p >= 1.0:
+        return 1.0 if k >= n else 0.0
+    lp, lq = math.log(p), math.log1p(-p)
+    lg_n = math.lgamma(n + 1)
+    terms = [lg_n - math.lgamma(i + 1) - math.lgamma(n - i + 1) + i * lp + (n - i) * lq for i in range(k + 1)]
+    m = max(terms)
+    return min(1.0, math.exp(m) * sum(math.exp(t - m) for t in terms))
+
+
+def cp_lower(successes: int, n: int, alpha: float = 0.025) -> float | None:
+    """One-sided Clopper-Pearson lower bound: the smallest p with P[X >= successes | p] >= alpha.
+    0 errors out of 20 gives 0.832, not 1.0 — the bound grows only with evidence."""
+    if n <= 0:
+        return None
+    if successes <= 0:
+        return 0.0
+    lo, hi = 0.0, successes / n
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        # P[X >= s | mid] = 1 - P[X <= s-1 | mid]
+        if 1.0 - _binom_cdf(successes - 1, n, mid) < alpha:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def cp_upper(events: int, n: int, alpha: float = 0.025) -> float | None:
+    """One-sided Clopper-Pearson upper bound on a rate (e.g. false accepts)."""
+    if n <= 0:
+        return None
+    low = cp_lower(n - events, n, alpha)
+    return None if low is None else 1.0 - low

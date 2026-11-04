@@ -105,12 +105,16 @@ class Export:
     # ------------------------------------------------------------ identity --
     def key(self, person_id: str | None) -> str | None:
         """Identity key of a person id: alias if one is mapped, else the id itself.
-        Merges (``merged_into``) are followed one hop, as the backend does."""
+        Merges (``merged_into``) are followed to the end of the chain (X -> Y -> Z gives Z's
+        key), with a cycle guard; the backend folds every hop the same way."""
         if not person_id:
             return None
+        seen = {person_id}
         p = self.people.get(person_id)
-        if p is not None and p.merged_into:
+        while p is not None and p.merged_into and p.merged_into not in seen:
             person_id = p.merged_into
+            seen.add(person_id)
+            p = self.people.get(person_id)
         return self.aliases.get(person_id, person_id)
 
     def roster(self, facility_id: str) -> dict[str, str]:
@@ -174,33 +178,41 @@ def load_export(root: str | Path, aliases_csv: str | Path | None = None) -> Expo
         facility_tz[r["id"]] = r.get("time_zone") or "Asia/Shanghai"
         facility_org[r["id"]] = r.get("org_id") or "0"
 
+    # face_gallery may hold several rows per person (one per person_type): a person is
+    # tentative only if every active row is, merged if any active row is. A person whose
+    # gallery rows are all inactive (deleted) is NOT brought back by a roster or role row.
     people: dict[str, Person] = {}
+    deleted: set[str] = set()
     for r in _rows(root / "face_gallery.csv"):
+        pid = r["person_id"]
         if r.get("state", "1") != "1":
+            deleted.add(pid)
             continue
-        people[r["person_id"]] = Person(
-            person_id=r["person_id"], facility_id=r["facility_id"],
-            person_type=_str(r.get("person_type")), tentative=r.get("tentative") == "1",
-            merged_into=_str(r.get("merged_into")))
-    for r in _rows(root / "person_roster.csv"):
-        if r.get("state", "1") != "1":
-            continue
-        p = people.get(r["person_id"])
+        p = people.get(pid)
         if p is None:
-            people[r["person_id"]] = Person(
-                person_id=r["person_id"], facility_id=r.get("facility_id") or "",
-                merged_into=_str(r.get("merged_into")))
+            people[pid] = Person(person_id=pid, facility_id=r["facility_id"],
+                                 person_type=_str(r.get("person_type")), tentative=r.get("tentative") == "1",
+                                 merged_into=_str(r.get("merged_into")))
+        else:
+            p.tentative = p.tentative and r.get("tentative") == "1"
+            p.merged_into = p.merged_into or _str(r.get("merged_into"))
+    deleted -= set(people)
+    for r in _rows(root / "person_roster.csv"):
+        pid = r["person_id"]
+        if r.get("state", "1") != "1" or pid in deleted:
+            continue
+        p = people.get(pid)
+        if p is None:  # a board-minted registered person known only from a board roster
+            people[pid] = Person(person_id=pid, facility_id=r.get("facility_id") or "",
+                                 merged_into=_str(r.get("merged_into")))
         elif not p.merged_into and _str(r.get("merged_into")):
             p.merged_into = r["merged_into"]
     role_path = root / "person_identity_role.csv"
     if role_path.exists():
-        for r in _rows(role_path):
-            if r.get("state", "1") != "1":
-                continue
+        for r in _rows(role_path):  # annotates people; never creates one
             p = people.get(r["person_id"])
-            if p is None:
-                p = people[r["person_id"]] = Person(person_id=r["person_id"], facility_id=r["facility_id"])
-            p.role = _str(r.get("role"))
+            if p is not None and r.get("state", "1") == "1":
+                p.role = _str(r.get("role"))
 
     sightings: list[Sighting] = []
     for r in _rows(root / "person_sightings.csv"):
