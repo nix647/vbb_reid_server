@@ -86,13 +86,16 @@ def write_export(root: Path, sightings: list[dict], people: list[tuple[str, str,
 
 
 def write_face_cache(emb: Path, facility: str, day: str, rows: list[tuple[str, int, np.ndarray, float, float]]) -> None:
+    """rows: (sid, crop, vec, qf, face_h). Measures are chosen so the default policy reproduces
+    ``qf`` exactly for face_h >= 40 (det = qf; blur, residual, asym, yaw neutral)."""
     d = _dir(emb, "face", FACE_ID, facility)
-    np.savez(d / f"{day}.npz",
+    n = len(rows)
+    np.savez(d / f"{day}.npz", schema=np.int64(2),
              sighting_id=np.array([r[0] for r in rows], dtype=object), crop_idx=np.array([r[1] for r in rows]),
-             source=np.array(["cdn"] * len(rows), dtype=object),
+             source=np.array(["cdn"] * n, dtype=object),
              vec=np.stack([r[2] for r in rows]).astype(np.float32) if rows else np.zeros((0, D), np.float32),
-             qf=np.array([r[3] for r in rows]), face_h=np.array([r[4] for r in rows]),
-             det=np.ones(len(rows)), residual=np.zeros(len(rows)))
+             face_h=np.array([r[4] for r in rows], dtype=float), det=np.array([r[3] for r in rows], dtype=float),
+             blur=np.full(n, 1000.0), residual=np.zeros(n), asym=np.zeros(n), yaw=np.zeros(n))
 
 
 def write_body_cache(emb: Path, facility: str, day: str, rows: list[tuple[str, int, np.ndarray]]) -> None:

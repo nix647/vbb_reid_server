@@ -8,6 +8,7 @@
   adjudicate-page    build the HTML page for a sample
   adjudicate-score   score a shadow run against exported answers
   prune              delete cached crops / embeddings older than N days
+  quality-report     which face-quality measures predict a reliable match (on human labels)
   doctor             check GPU, ONNX Runtime providers, torch, and (optionally) load a model set
 """
 
@@ -24,6 +25,7 @@ from pathlib import Path
 from .data import load_export
 from .decide import Thresholds
 from .pipeline import RefPolicy, Workspace
+from .quality import QualityPolicy
 
 
 def _thresholds(args) -> Thresholds:
@@ -78,7 +80,8 @@ def cmd_embed(args) -> None:
         for day in ex.days(fac):
             if days and day not in days:
                 continue
-            embed_day(ex.by_facility_day(fac, day), store, ms, args.emb, fac, day, face_min_px=args.face_min_px)
+            embed_day(ex.by_facility_day(fac, day), store, ms, args.emb, fac, day, face_min_px=args.face_min_px,
+                      refresh=args.refresh)
     print(f"[embed] crop sources: {store.stats}")
     print(f"[embed] face model: {ms.face_id}\n[embed] body model: {ms.body_id}")
 
@@ -89,7 +92,7 @@ def cmd_eval(args) -> None:
     ex = load_export(args.export, args.aliases)
     face_id = _ids_from_cache(args.emb, "face", args.face_model)
     body_id = _ids_from_cache(args.emb, "body", args.body_model)
-    ws = Workspace(ex, args.emb, face_id, body_id)
+    ws = Workspace(ex, args.emb, face_id, body_id, QualityPolicy.from_file(args.quality))
     base = _thresholds(args)
     policy = RefPolicy(window_days=args.window_days, ref_q_min=args.ref_q_min, max_refs=args.max_refs)
     grid = load_grid(args.grid)
@@ -118,7 +121,7 @@ def cmd_shadow(args) -> None:
     ex = load_export(args.export, args.aliases)
     face_id = _ids_from_cache(args.emb, "face", args.face_model)
     body_id = _ids_from_cache(args.emb, "body", args.body_model)
-    ws = Workspace(ex, args.emb, face_id, body_id)
+    ws = Workspace(ex, args.emb, face_id, body_id, QualityPolicy.from_file(args.quality))
     th = _thresholds(args)
     days = args.days.split(",") if args.days else ex.days(args.facility)
     for day in days:
@@ -168,6 +171,16 @@ def cmd_prune(args) -> None:
     print(f"[prune] removed {n_c} cached crops, {n_e} embedding files older than {args.days} days")
 
 
+def cmd_quality_report(args) -> None:
+    from .quality_report import report
+    ex = load_export(args.export, args.aliases)
+    face_id = _ids_from_cache(args.emb, "face", args.face_model)
+    ws = Workspace(ex, args.emb, face_id, None, QualityPolicy.from_file(args.quality))
+    days = args.days.split(",") if args.days else ex.days(args.facility)
+    report(ws, args.facility, days, bins=args.bins, far=args.far, max_faces=args.max_faces,
+           out_csv=Path(args.out) if args.out else None)
+
+
 def cmd_doctor(args) -> None:
     import platform
     print(f"python {platform.python_version()} on {platform.platform()}")
@@ -204,6 +217,19 @@ def cmd_doctor(args) -> None:
             where = sess.get_providers()[0] if sess is not None else getattr(m, "device", "?")
             print(f"{part}: {m.model_id}  [{where}]")
         print(f"face model id: {ms.face_id}\nbody model id: {ms.body_id}")
+        import numpy as np
+        rng = np.random.default_rng(0)
+        if ms.face is not None:
+            faces = [(rng.random((112, 112, 3)) * 255).astype(np.uint8) for _ in range(5)]
+            batched = ms.face.embed(faces)
+            single = np.concatenate([ms.face.embed([f]) for f in faces])
+            print(f"face batched vs one-by-one: max |diff| = {float(np.abs(batched - single).max()):.2e}, "
+                  f"min cosine = {float((batched * single).sum(1).min()):.6f}  (expect ~1e-6 and 1.000000)")
+        if ms.body is not None:
+            crops = [(rng.random((256, 128, 3)) * 255).astype(np.uint8) for _ in range(5)]
+            batched = ms.body.embed(crops)
+            single = np.concatenate([ms.body.embed([c]) for c in crops])
+            print(f"body batched vs one-by-one: min cosine = {float((batched * single).sum(1).min()):.6f}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -230,6 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--cdn-cache", help="where CDN crops are cached")
     sp.add_argument("--no-fetch", action="store_true", help="never download; use caches only")
     sp.add_argument("--face-min-px", type=float, default=12.0)
+    sp.add_argument("--refresh", action="store_true", help="re-embed days already in the cache")
     sp.set_defaults(fn=cmd_embed)
 
     sp = sub.add_parser("eval")
@@ -241,6 +268,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--refs-mode", nargs="+", default=["temporal", "lodo"], choices=["temporal", "lodo"])
     sp.add_argument("--grid", help="'quick' or a JSON file {param: [values]}")
     sp.add_argument("--thresholds", help="JSON with base Thresholds overrides")
+    sp.add_argument("--quality", help="JSON QualityPolicy overrides (applied when the cache is read)")
     sp.add_argument("--window-days", type=int, default=60)
     sp.add_argument("--ref-q-min", type=float, default=0.40)
     sp.add_argument("--max-refs", type=int, default=300)
@@ -257,6 +285,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--face-model")
     sp.add_argument("--body-model")
     sp.add_argument("--thresholds", help="JSON with the chosen operating point")
+    sp.add_argument("--quality", help="JSON QualityPolicy overrides")
     sp.add_argument("--setup")
     sp.add_argument("--out", required=True)
     sp.set_defaults(fn=cmd_shadow)
@@ -284,6 +313,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--answers", required=True)
     sp.add_argument("--labels", nargs="+", required=True, help="shadow labels CSV(s)")
     sp.set_defaults(fn=cmd_adj_score)
+
+    sp = sub.add_parser("quality-report")
+    common(sp)
+    sp.add_argument("--facility", required=True)
+    sp.add_argument("--days", help="comma list; default every day in the export")
+    sp.add_argument("--face-model", required=True, help="cached face model (slug or substring)")
+    sp.add_argument("--quality", help="JSON QualityPolicy overrides for the qf rows")
+    sp.add_argument("--bins", type=int, default=5)
+    sp.add_argument("--far", type=float, default=1e-3)
+    sp.add_argument("--max-faces", type=int, default=4000)
+    sp.add_argument("--out", help="CSV of the table")
+    sp.set_defaults(fn=cmd_quality_report)
 
     sp = sub.add_parser("doctor")
     sp.add_argument("--models", help="model config JSON to load as a test")

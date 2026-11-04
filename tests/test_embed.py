@@ -98,3 +98,28 @@ def test_embed_then_evaluate_with_body(tmp_path):
     r = res[0]
     assert r.total.correct == 2 and r.total.wrong == 0
     assert r.by_via["body"].correct == 1  # the face-less sighting was named through its body
+
+
+def test_embed_rebuilds_a_0_1_0_cache_day(tmp_path):
+    from vbb_reid_server.embed import FACE_SCHEMA, _dir
+    day = "2026-10-20"
+    base = int(datetime(2026, 10, 20, 8, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp() * 1000)
+    lan = tmp_path / "lan"
+    rows = [{"sighting_id": "s1", "facility_id": "3", "did": "45", "capture_ts": base,
+             "image_url": "https://cdn.invalid/s1.jpg"}]
+    jpg(lan / "45" / day / "s1" / "0.jpg", COLORS["A"])
+    write_export(tmp_path / "export", rows, [("pA", "3", "visitor")], facilities=(("3", "2"),))
+    ex = load_export(tmp_path / "export")
+    face = StubEmbed("stub-face")
+    ms = ModelSet("stub", StubDetector(), face, None)
+    emb = tmp_path / "emb"
+    d = _dir(emb, "face", ms.face_id, "3")
+    np.savez(d / f"{day}.npz", sighting_id=np.array(["s1"], dtype=object), crop_idx=np.array([0]),
+             source=np.array(["lan"], dtype=object), vec=np.zeros((1, 4), np.float32), qf=np.array([0.0]),
+             face_h=np.array([60.0]), det=np.array([0.9]), residual=np.array([7.0]))
+    (d / f"{day}.done").write_text("s1:0")
+    embed_day(ex.by_facility_day("3", day), CropStore(lan, None, fetch=False), ms, emb, "3", day,
+              log=lambda *_: None)
+    assert face.calls == 1  # the stale day was recomputed, not skipped by its .done file
+    z = np.load(d / f"{day}.npz", allow_pickle=True)
+    assert int(z["schema"]) == FACE_SCHEMA and "qf" not in z.files and "blur" in z.files

@@ -1,9 +1,12 @@
 """Embed every crop of a facility-day and cache the result per model.
 
 Cache layout (``--emb`` root):
-  <root>/face/<face_slug>/<facility>/<day>.npz   sighting_id, crop_idx, source, vec, qf,
-                                                 face_h, det, residual   (one row per crop
-                                                 with a usable face)
+  <root>/face/<face_slug>/<facility>/<day>.npz   schema=2; sighting_id, crop_idx, source, vec,
+                                                 and the quality MEASURES face_h, det, blur,
+                                                 residual, asym, yaw (one row per crop with a
+                                                 detected face). qf is NOT stored: it is computed
+                                                 on read from a QualityPolicy, so changing the
+                                                 policy never needs a re-embed.
   <root>/face/<face_slug>/<facility>/<day>.done  sighting_id:crop_idx lines already processed
   <root>/body/<body_slug>/<facility>/<day>.npz   sighting_id, crop_idx, source, vec
   <root>/<kind>/<slug>/model.json                the full model id
@@ -23,14 +26,21 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .align import norm_crop
+from .align import norm_crop_points
 from .crops import CropRef, CropStore
 from .data import Sighting
-from .quality import QualityPolicy, face_quality
+from .quality import QualityPolicy, asymmetry, blur_var, qf_from_measures, yaw_ratio
 
 
 def slug(model_id: str) -> str:
     return hashlib.sha256(model_id.encode()).hexdigest()[:16]
+
+
+FACE_SCHEMA = 2  # 1 = 0.1.0 (stored qf); 2 = raw quality measures, qf computed on read
+
+
+class StaleCache(RuntimeError):
+    pass
 
 
 @dataclass
@@ -39,19 +49,29 @@ class FaceTable:
     crop_idx: np.ndarray  # (N,) int
     source: np.ndarray  # (N,) str
     vec: np.ndarray  # (N, D) float32
-    qf: np.ndarray
-    face_h: np.ndarray
+    face_h: np.ndarray  # quality MEASURES (stored)
     det: np.ndarray
+    blur: np.ndarray
     residual: np.ndarray
+    asym: np.ndarray
+    yaw: np.ndarray
+    qf: np.ndarray  # derived on read from a QualityPolicy (never stored)
+
+    MEASURES = ("face_h", "det", "blur", "residual", "asym", "yaw")
 
     @classmethod
     def empty(cls, dim: int = 0) -> "FaceTable":
         z = np.zeros(0)
         return cls(np.zeros(0, dtype=object), np.zeros(0, dtype=int), np.zeros(0, dtype=object),
-                   np.zeros((0, dim), dtype=np.float32), z, z, z, z)
+                   np.zeros((0, dim), dtype=np.float32), z, z, z, z, z, z, z)
 
     def __len__(self) -> int:
         return int(self.sighting_id.shape[0])
+
+    def with_policy(self, policy: QualityPolicy) -> "FaceTable":
+        self.qf = qf_from_measures(self.det, self.face_h, self.blur, self.residual, self.asym, self.yaw, policy) \
+            if len(self) else np.zeros(0)
+        return self
 
 
 @dataclass
@@ -79,13 +99,23 @@ def _dir(root: Path, kind: str, model_id: str, facility: str) -> Path:
     return d
 
 
-def load_face(root: Path, model_id: str, facility: str, day: str) -> FaceTable:
-    f = root / "face" / slug(model_id) / facility / f"{day}.npz"
+def _face_path(root: Path, model_id: str, facility: str, day: str) -> Path:
+    return root / "face" / slug(model_id) / facility / f"{day}.npz"
+
+
+def load_face(root: Path, model_id: str, facility: str, day: str,
+              policy: QualityPolicy | None = None) -> FaceTable:
+    f = _face_path(root, model_id, facility, day)
     if not f.exists():
         return FaceTable.empty()
     z = np.load(f, allow_pickle=True)
-    return FaceTable(z["sighting_id"], z["crop_idx"], z["source"], z["vec"], z["qf"],
-                     z["face_h"], z["det"], z["residual"])
+    schema = int(z["schema"]) if "schema" in z.files else 1
+    if schema < FACE_SCHEMA:
+        raise StaleCache(f"{f} was written by vbb-reid-server 0.1.0 (stored qf); re-embed that day with "
+                         f"`embed --refresh` (crops are cached, so only the GPU work repeats)")
+    t = FaceTable(z["sighting_id"], z["crop_idx"], z["source"], z["vec"], z["face_h"], z["det"], z["blur"],
+                  z["residual"], z["asym"], z["yaw"], np.zeros(len(z["sighting_id"])))
+    return t.with_policy(policy or QualityPolicy())
 
 
 def load_body(root: Path, model_id: str, facility: str, day: str) -> BodyTable:
@@ -116,8 +146,8 @@ def _best_face(dets, img_h: int):
 
 
 def embed_day(sightings: list[Sighting], store: CropStore, models, emb_root: str | Path,
-              facility: str, day: str, *, policy: QualityPolicy = QualityPolicy(),
-              face_min_px: float = 12.0, log=print) -> dict[str, int]:
+              facility: str, day: str, *, face_min_px: float = 12.0, refresh: bool = False,
+              log=print) -> dict[str, int]:
     """Embed every crop of the given sightings (one facility-day) and merge into the cache."""
     root = Path(emb_root)
     stats = {"sightings": len(sightings), "crops": 0, "faces": 0, "bodies": 0, "unreadable": 0}
@@ -130,9 +160,14 @@ def embed_day(sightings: list[Sighting], store: CropStore, models, emb_root: str
     if face_id:
         fdir = _dir(root, "face", face_id, facility)
         done_path = fdir / f"{day}.done"
-        if done_path.exists():
+        try:
+            old_face = FaceTable.empty() if refresh else load_face(root, face_id, facility, day)
+        except StaleCache:
+            log(f"[embed] facility {facility} {day}: cache from 0.1.0 (stored qf) - re-embedding the day")
+            refresh = True
+            old_face = FaceTable.empty()
+        if done_path.exists() and not refresh:
             done = set(done_path.read_text().split())
-        old_face = load_face(root, face_id, facility, day)
     if body_id:
         _dir(root, "body", body_id, facility)
         old_body = load_body(root, body_id, facility, day)
@@ -160,24 +195,24 @@ def embed_day(sightings: list[Sighting], store: CropStore, models, emb_root: str
                 det = _best_face(models.face_detector.detect(img), img.shape[0])
                 if det is None or det.height < face_min_px:
                     continue
-                aligned, residual = norm_crop(img, det.kps)
-                qf = face_quality(det.score, det.height, det.kps, aligned, residual, policy)
-                f_rows.append((s.sighting_id, ref.index, ref.source, qf, det.height, det.score, residual))
+                aligned, per_point = norm_crop_points(img, det.kps)
+                f_rows.append((s.sighting_id, ref.index, ref.source, det.height, det.score, blur_var(aligned),
+                               float(per_point.mean()), asymmetry(per_point), yaw_ratio(det.kps)))
                 f_imgs.append(aligned)
 
     if face_id:
         vecs = models.face.embed(f_imgs) if f_imgs else np.zeros((0, old_face.vec.shape[1] if len(old_face) else 0), np.float32)
         stats["faces"] = len(f_rows)
+        col = lambda i: np.array([r[i] for r in f_rows], dtype=float)  # noqa: E731
         new = FaceTable(
             np.array([r[0] for r in f_rows], dtype=object), np.array([r[1] for r in f_rows], dtype=int),
             np.array([r[2] for r in f_rows], dtype=object), vecs.astype(np.float32),
-            np.array([r[3] for r in f_rows], dtype=float), np.array([r[4] for r in f_rows], dtype=float),
-            np.array([r[5] for r in f_rows], dtype=float), np.array([r[6] for r in f_rows], dtype=float))
+            col(3), col(4), col(5), col(6), col(7), col(8), np.zeros(len(f_rows)))
         merged = _concat_face(old_face, new)
         fdir = root / "face" / slug(face_id) / facility
-        np.savez(fdir / f"{day}.npz", sighting_id=merged.sighting_id, crop_idx=merged.crop_idx,
-                 source=merged.source, vec=merged.vec, qf=merged.qf, face_h=merged.face_h,
-                 det=merged.det, residual=merged.residual)
+        np.savez(fdir / f"{day}.npz", schema=np.int64(FACE_SCHEMA), sighting_id=merged.sighting_id,
+                 crop_idx=merged.crop_idx, source=merged.source, vec=merged.vec,
+                 **{m: getattr(merged, m) for m in FaceTable.MEASURES})
         (fdir / f"{day}.done").write_text("\n".join(sorted(done)))
     if body_id:
         vecs = models.body.embed(b_imgs) if b_imgs else np.zeros((0, old_body.vec.shape[1] if len(old_body) else 0), np.float32)
@@ -198,9 +233,8 @@ def _concat_face(a: FaceTable, b: FaceTable) -> FaceTable:
         return b
     if len(b) == 0:
         return a
-    return FaceTable(*(np.concatenate([x, y]) for x, y in (
-        (a.sighting_id, b.sighting_id), (a.crop_idx, b.crop_idx), (a.source, b.source), (a.vec, b.vec),
-        (a.qf, b.qf), (a.face_h, b.face_h), (a.det, b.det), (a.residual, b.residual))))
+    names = ("sighting_id", "crop_idx", "source", "vec") + FaceTable.MEASURES + ("qf",)
+    return FaceTable(*(np.concatenate([getattr(a, n), getattr(b, n)]) for n in names))
 
 
 def _concat_body(a: BodyTable, b: BodyTable) -> BodyTable:

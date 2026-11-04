@@ -19,6 +19,7 @@ import numpy as np
 from .data import Export, Sighting
 from .embed import BodyTable, FaceTable, load_body, load_face
 from .models.base import l2n
+from .quality import QualityPolicy
 
 
 @dataclass(frozen=True)
@@ -30,8 +31,10 @@ class RefPolicy:
 
 
 class Workspace:
-    def __init__(self, export: Export, emb_root: str | Path, face_id: str | None, body_id: str | None):
+    def __init__(self, export: Export, emb_root: str | Path, face_id: str | None, body_id: str | None,
+                 quality: QualityPolicy | None = None):
         self.export = export
+        self.quality = quality or QualityPolicy()
         self.emb_root = Path(emb_root)
         self.face_id = face_id
         self.body_id = body_id
@@ -43,7 +46,7 @@ class Workspace:
     def face_table(self, facility: str, day: str) -> FaceTable:
         k = (facility, day)
         if k not in self._face:
-            self._face[k] = load_face(self.emb_root, self.face_id, facility, day) if self.face_id else FaceTable.empty()
+            self._face[k] = load_face(self.emb_root, self.face_id, facility, day, self.quality) if self.face_id else FaceTable.empty()
         return self._face[k]
 
     def body_table(self, facility: str, day: str) -> BodyTable:

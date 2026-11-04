@@ -38,12 +38,18 @@ def umeyama_similarity(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
     return m
 
 
-def norm_crop(img: np.ndarray, kps: np.ndarray, size: int = 112) -> tuple[np.ndarray, float]:
-    """Warp a face to ``size``x``size``. Returns (aligned BGR image, mean landmark
-    residual in pixels after alignment — a misalignment signal)."""
+def norm_crop_points(img: np.ndarray, kps: np.ndarray, size: int = 112) -> tuple[np.ndarray, np.ndarray]:
+    """Warp a face to ``size``x``size``. Returns (aligned BGR image, per-landmark residual in
+    aligned pixels, shape (5,)). A non-frontal face leaves residual by construction: the
+    template is frontal."""
     dst = ARCFACE_DST * (size / 112.0)
     m = umeyama_similarity(kps, dst)
     aligned = cv2.warpAffine(img, m, (size, size), borderValue=0.0)
     proj = (m[:, :2] @ np.asarray(kps, dtype=np.float64).T).T + m[:, 2]
-    residual = float(np.linalg.norm(proj - dst, axis=1).mean())
-    return aligned, residual
+    return aligned, np.linalg.norm(proj - dst, axis=1)
+
+
+def norm_crop(img: np.ndarray, kps: np.ndarray, size: int = 112) -> tuple[np.ndarray, float]:
+    """As :func:`norm_crop_points`, with the mean residual."""
+    aligned, per_point = norm_crop_points(img, kps, size)
+    return aligned, float(per_point.mean())

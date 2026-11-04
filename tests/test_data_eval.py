@@ -147,3 +147,14 @@ def test_two_people_note_makes_an_answer_mixed(tmp_path):
     p.write_text('sighting_id,answer,note\n"a","H2","2 people, 昌爷 and 史迪仔"\n"b","cant_tell","2 people "\n'
                  '"c","H1",""\n"d","H1","两个人"\n', encoding="utf-8")
     assert read_answers(p) == {"a": "mixed", "b": "mixed", "c": "H1", "d": "mixed"}
+
+
+def test_the_grid_can_sweep_the_quality_floor(tmp_path):
+    exp, emb = build(tmp_path)
+    ex = load_export(exp, tmp_path / "aliases.csv")
+    ws = Workspace(ex, emb, FACE_ID, None)
+    grid = {"face_sim": [0.5], "face_margin": [0.1], "face_q_min": [0.0, 0.95], "body_enabled": [False]}
+    res = evaluate_facility(ws, "3", refs_mode="temporal", grid=grid, base=Thresholds(min_refs=3),
+                            days=["2026-10-20"], loo=False, log=lambda *_: None)
+    by_q = {r.th.face_q_min: r for r in res}
+    assert by_q[0.0].total.correct == 6 and by_q[0.95].total.labeled == 0  # all test faces have qf 0.9

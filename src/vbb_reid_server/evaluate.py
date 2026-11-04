@@ -29,6 +29,7 @@ from .pipeline import RefPolicy, Workspace, org_facilities
 QUICK_GRID = {
     "face_sim": [0.30, 0.35, 0.40, 0.45, 0.50, 0.55],
     "face_margin": [0.05, 0.10, 0.15, 0.20],
+    "face_q_min": [0.0, 0.15, 0.30],
     "body_enabled": [False, True],
 }
 
@@ -105,8 +106,17 @@ def evaluate_facility(ws: Workspace, facility: str, *, refs_mode: str = "tempora
                         bucket.add("abstain")
                 r.unlabeled_pool += len(unlabeled_pool)
             continue
-        fs = face_scores(probe_faces, refs, base)
-        loo_inputs = []
+        # face_scores depends on the quality floor, face size floor and top-k, which a grid may vary:
+        # compute it once per distinct (face_q_min, face_min_px, topk).
+        fs_cache: dict[tuple, object] = {}
+
+        def fs_for(th: Thresholds, refs_used: dict, tag: str):
+            key = (tag, th.face_q_min, th.face_min_px, th.topk)
+            if key not in fs_cache:
+                fs_cache[key] = face_scores(probe_faces, refs_used, th)
+            return fs_cache[key]
+
+        loo_sets = []
         if loo:
             for k in sorted(refs):
                 k_targets = {sid for sid, t in targets.items() if t == k}
@@ -114,8 +124,9 @@ def evaluate_facility(ws: Workspace, facility: str, *, refs_mode: str = "tempora
                     continue
                 refs_k = {p: v for p, v in refs.items() if p != k}
                 if refs_k:
-                    loo_inputs.append((k, k_targets, face_scores(probe_faces, refs_k, base)))
+                    loo_sets.append((k, k_targets, refs_k))
         for r in results:
+            fs = fs_for(r.th, refs, "all")
             labels = {l.sighting_id: l for l in decide_day(sightings, fs, body, body_crops, roster, ex.key, r.th)}
             for sid, truth in targets.items():
                 s = ws.sighting(sid)
@@ -133,7 +144,8 @@ def evaluate_facility(ws: Workspace, facility: str, *, refs_mode: str = "tempora
                     r.unlabeled_promotions += 1
                     if lab.via == "body":
                         r.unlabeled_promotions_body += 1
-            for k, k_targets, fs_k in loo_inputs:
+            for k, k_targets, refs_k in loo_sets:
+                fs_k = fs_for(r.th, refs_k, f"loo:{k}")
                 lab_k = {l.sighting_id: l for l in decide_day(sightings, fs_k, body, body_crops, roster, ex.key, r.th)}
                 for sid in k_targets:
                     lab = lab_k.get(sid)
@@ -142,7 +154,7 @@ def evaluate_facility(ws: Workspace, facility: str, *, refs_mode: str = "tempora
 
 
 CURVE_FIELDS = [
-    "setup", "refs_mode", "facility", "face_sim", "face_margin", "body_enabled", "body_link",
+    "setup", "refs_mode", "facility", "face_sim", "face_margin", "face_q_min", "body_enabled", "body_link",
     "n_targets", "correct", "wrong", "flagged", "abstain", "precision", "precision_lo95_days", "coverage",
     "promote_n", "promote_precision", "promote_coverage",
     "face_precision", "body_precision", "body_labeled",
@@ -166,7 +178,7 @@ def curve_rows(results: list[ComboResult], setup: str, refs_mode: str, facility:
         nf = r.by_face.get("noface", Tally())
         rows.append({
             "setup": setup, "refs_mode": refs_mode, "facility": facility,
-            "face_sim": r.th.face_sim, "face_margin": r.th.face_margin,
+            "face_sim": r.th.face_sim, "face_margin": r.th.face_margin, "face_q_min": r.th.face_q_min,
             "body_enabled": int(r.th.body_enabled), "body_link": r.th.body_link,
             "n_targets": r.total.n, "correct": r.total.correct, "wrong": r.total.wrong,
             "flagged": r.total.flagged, "abstain": r.total.abstain,
@@ -212,7 +224,7 @@ def summarize(rows: list[dict], point: dict | None) -> str:
         lines.append("no threshold pair meets the precision / false-accept targets")
     else:
         lines.append("operating point: " + ", ".join(f"{k}={point[k]}" for k in (
-            "face_sim", "face_margin", "body_enabled", "precision", "precision_lo95_days", "coverage",
+            "face_sim", "face_margin", "face_q_min", "body_enabled", "precision", "precision_lo95_days", "coverage",
             "promote_precision", "promote_coverage", "noface_coverage", "loo_fa_rate", "unlabeled_promotions")))
     return "\n".join(lines)
 
@@ -222,7 +234,7 @@ def per_sighting_wrongs(results: list[ComboResult], point: dict | None) -> list[
         return []
     for r in results:
         if (r.th.face_sim == point["face_sim"] and r.th.face_margin == point["face_margin"]
-                and int(r.th.body_enabled) == int(point["body_enabled"])):
+                and r.th.face_q_min == point["face_q_min"] and int(r.th.body_enabled) == int(point["body_enabled"])):
             return r.total.wrong_ids
     return []
 
