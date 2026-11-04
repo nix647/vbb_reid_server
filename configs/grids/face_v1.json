@@ -1,0 +1,7 @@
+{
+  "_comment": "Face-only first evaluation: 7 x 4 x 4 = 112 rows. face_q_min spans both policies' qf range (about 0.25-0.6 for typical faces).",
+  "face_sim": [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55],
+  "face_margin": [0.05, 0.10, 0.15, 0.20],
+  "face_q_min": [0.0, 0.2, 0.3, 0.4],
+  "body_enabled": [false]
+}

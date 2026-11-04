@@ -1,0 +1,3 @@
+{
+  "_comment": "Policy A: the 0.1.2 default (board-shaped: det x power mean of pose, size, blur and gated asymmetry; residual off). Empty on purpose: every field keeps its default."
+}

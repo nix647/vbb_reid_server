@@ -51,7 +51,7 @@ echo 'export HF_HOME=/vmdata/vbb_eval/hf' >> ~/.bashrc && export HF_HOME=/vmdata
 cd ~/vbb_reid_server && pytest -q && vbb-reid-server doctor
 ```
 
-Expected: `56 passed` (0.1.2); `onnxruntime ... providers [...'CUDAExecutionProvider'...]`;
+Expected: `57 passed` (0.1.2 + configs); `onnxruntime ... providers [...'CUDAExecutionProvider'...]`;
 `torch ... cuda available=True, device NVIDIA GeForce RTX 4070 Ti SUPER`.
 If `CUDAExecutionProvider` is missing, the CPU build may have been installed next to the GPU build
 (0.1.0/0.1.1's `dev` extra pulled it in; both provide the same module). Fix and check again:
@@ -193,7 +193,10 @@ Check that batching does not change embeddings (the `Expected shape {1,512}` war
 vbb-reid-server doctor --models /vmdata/vbb_eval/models/buffalo_l_face.json
 ```
 
-Expected: `face batched vs one-by-one: max |diff| = ...e-06 or smaller, min cosine = 1.000000`.
+Expected: `face batched vs one-by-one: max |diff|` below 1e-3 and `min cosine` at least 0.9999. The
+GPU picks different kernels per batch size, so batched and one-by-one differ slightly but each is
+exactly repeatable (measured 2026-11-04 on 128 real faces: max 1.7e-4, pair similarity shift at
+most 2.7e-4 against a 0.25 threshold). The pipeline always embeds in batches.
 
 Measure which quality measures matter, on your labels:
 
@@ -207,6 +210,43 @@ vbb-reid-server quality-report --export /vmdata/vbb_eval/export --aliases /vmdat
 per band, the genuine and impostor median similarity and TAR (share of same-person pairs above
 the 1-in-1000 impostor score). From it we set the quality policy (a small JSON passed as
 `--quality`) and the cutoffs the evaluation sweeps. Then the full embed.
+
+## 6c. Full embed, then choose the quality policy from data (0.1.2)
+
+The embed does NOT depend on the quality policy (qf is computed when the cache is read), so it
+runs first. Keep the CDN off the proxy (step 2); the 10-16 test day showed that almost all of the
+time is downloading (388 s with downloads, 8.4 s from the cache).
+
+```bash
+vbb-reid-server embed --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv \
+  --emb /vmdata/vbb_eval/emb --models /vmdata/vbb_eval/models/buffalo_l_face.json \
+  --facility 3 2 --lan-crops /vmdata/vbb_eval/crops --cdn-cache /vmdata/vbb_eval/cdn 2>&1 | tee /vmdata/vbb_eval/out/embed_full.log
+```
+
+Then compare the two policies in `configs/quality/` on ALL labeled days (more people, less H1):
+
+```bash
+for P in A_default B_tuned_2026-11-04; do for F in 3 2; do
+  vbb-reid-server quality-report --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv \
+    --emb /vmdata/vbb_eval/emb --face-model RGB:m127.5 --facility $F \
+    --quality configs/quality/$P.json --out /vmdata/vbb_eval/out/quality_${P}_f$F.csv | tee /vmdata/vbb_eval/out/quality_${P}_f$F.txt
+done; done
+```
+
+And the face-only evaluation under each policy (CPU only; reads the cache):
+
+```bash
+for P in A_default B_tuned_2026-11-04; do
+  vbb-reid-server eval --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv \
+    --emb /vmdata/vbb_eval/emb --face-model RGB:m127.5 --facility 3 2 --grid configs/grids/face_v1.json \
+    --quality configs/quality/$P.json --setup "buffalo_l face, policy $P" --out /vmdata/vbb_eval/out/eval_$P 2>&1 | tee /vmdata/vbb_eval/out/eval_$P.log
+done
+```
+
+**Send me**: the `[embed]` summary lines of the full run (first and last few days, and any with
+`unreadable` or `cdn_failed` above 0); the `qf` section of each quality-report; and the `[eval]`
+summary blocks (both facilities, both reference modes, both policies). The `curve.csv` files stay
+on the box; I will ask for specific rows if needed.
 
 ## 7. After that (I will send the exact commands with the results of step 6b)
 

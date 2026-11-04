@@ -261,7 +261,8 @@ def cmd_doctor(args) -> None:
             batched = ms.face.embed(faces)
             single = np.concatenate([ms.face.embed([f]) for f in faces])
             print(f"face batched vs one-by-one: max |diff| = {float(np.abs(batched - single).max()):.2e}, "
-                  f"min cosine = {float((batched * single).sum(1).min()):.6f}  (expect ~1e-6 and 1.000000)")
+                  f"min cosine = {float((batched * single).sum(1).min()):.6f}  (fine: max |diff| below 1e-3 and min "
+                  f"cosine >= 0.9999; GPU kernels differ by batch size, measured 1.7e-4 on gpu-ubun 2026-11-04)")
         if ms.body is not None:
             crops = [(rng.random((256, 128, 3)) * 255).astype(np.uint8) for _ in range(5)]
             batched = ms.body.embed(crops)

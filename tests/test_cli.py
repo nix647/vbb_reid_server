@@ -47,3 +47,18 @@ def test_eval_writes_a_point_that_shadow_reads_back(tmp_path, capsys):
     run = json.loads(next((tmp_path / "sh").glob("run_*.json")).read_text())
     assert run["thresholds"] == pt["thresholds"] and run["ref_policy"]["ref_q_min"] == 0.3
     assert run["label_cutoff_ms"] is not None  # production-like by default
+
+
+def test_shipped_configs_load_and_unknown_grid_keys_are_refused(tmp_path):
+    from pathlib import Path
+    from vbb_reid_server.evaluate import load_grid
+    from vbb_reid_server.quality import QualityPolicy
+    root = Path(__file__).resolve().parents[1] / "configs"
+    for p in (root / "quality").glob("*.json"):
+        QualityPolicy.from_file(p)
+    for p in (root / "grids").glob("*.json"):
+        load_grid(str(p))
+    bad = tmp_path / "g.json"
+    bad.write_text(json.dumps({"face_simm": [0.3]}))
+    with pytest.raises(ValueError):
+        load_grid(str(bad))

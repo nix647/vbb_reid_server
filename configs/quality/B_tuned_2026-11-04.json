@@ -1,0 +1,11 @@
+{
+  "_comment": "Policy B: tuned to the quality-report of facility 3, 2026-10-16 (584 labeled faces, buffalo_l). Gentle, monotone ramps on the measures that separated genuine from impostor pairs; no term can veto a typical CCTV face. Residual (strongest signal) is back as a SOFT penalty (0.1.0 zeroed it at 6 px); asymmetry is off because it largely repeats the residual; yaw vetoes only true profiles. Compare with A through quality-report and eval before using it.",
+  "size_floor_px": 64,
+  "blur_min": 0,
+  "blur_max": 250,
+  "use_residual": true,
+  "residual_min": 4,
+  "residual_max": 20,
+  "use_asym": false,
+  "max_yaw_ratio": 1.5
+}

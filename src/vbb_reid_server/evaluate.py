@@ -17,7 +17,7 @@ from __future__ import annotations
 import csv
 import itertools
 import json
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -37,7 +37,12 @@ QUICK_GRID = {
 def load_grid(spec: str | None) -> dict[str, list]:
     if not spec or spec == "quick":
         return dict(QUICK_GRID)
-    return json.loads(Path(spec).read_text(encoding="utf-8"))
+    grid = {k: v for k, v in json.loads(Path(spec).read_text(encoding="utf-8")).items() if not k.startswith("_")}
+    known = {f.name for f in fields(Thresholds)}
+    unknown = sorted(set(grid) - known)
+    if unknown:
+        raise ValueError(f"unknown grid key(s): {', '.join(unknown)}; known: {', '.join(sorted(known))}")
+    return grid
 
 
 def combos(grid: dict[str, list], base: Thresholds) -> list[Thresholds]:
