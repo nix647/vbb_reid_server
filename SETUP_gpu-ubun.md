@@ -51,7 +51,7 @@ echo 'export HF_HOME=/vmdata/vbb_eval/hf' >> ~/.bashrc && export HF_HOME=/vmdata
 cd ~/vbb_reid_server && pytest -q && vbb-reid-server doctor
 ```
 
-Expected: `66 passed` (0.1.4); `onnxruntime ... providers [...'CUDAExecutionProvider'...]`;
+Expected: `72 passed` (0.1.5); `onnxruntime ... providers [...'CUDAExecutionProvider'...]`;
 `torch ... cuda available=True, device NVIDIA GeForce RTX 4070 Ti SUPER`.
 If `CUDAExecutionProvider` is missing, the CPU build may have been installed next to the GPU build
 (0.1.0/0.1.1's `dev` extra pulled it in; both provide the same module). Fix and check again:
@@ -371,13 +371,75 @@ vbb-reid-server shadow $COMMON --facility 3 --point $O/eval_refnorm0/point_3_tem
 vbb-reid-server adjudicate-score --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv \
   --answers /vmdata/vbb_eval/adj/adjudication_adjudication_f3_set1_sample.csv --labels $O/shadow/labels_3_*.csv | tee $O/adjscore.json
 vbb-reid-server adjudicate-sample $COMMON --facility 3 --n 100 --named-by $O/shadow/labels_3_*.csv --norm-below 16 \
-  --exclude /vmdata/vbb_eval/adj/adjudication_f3_set1_sample.csv --out /vmdata/vbb_eval/adj/sample_f3_lownorm.csv
+  --exclude /vmdata/vbb_eval/adj/adjudication_adjudication_f3_set1_sample.csv --out /vmdata/vbb_eval/adj/sample_f3_lownorm.csv
 vbb-reid-server adjudicate-page --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv --facility 3 \
   --sample /vmdata/vbb_eval/adj/sample_f3_lownorm.csv --lan-crops /vmdata/vbb_eval/crops --out /vmdata/vbb_eval/adj/page_f3_lownorm.html
 ```
 
 **Send me**: the VERDICT blocks and the printed rows of step 1, the two lines of step 2, the
 `inspect` output, `adjscore.json`, and — once labeled — the low-norm answers CSV.
+
+## 6f. Why H1 attracts junk, the pinned guards, and new names only (0.1.5)
+
+The low-norm set (2026-11-05) showed new names below norm 14 are wrong about half the time, 18 of
+19 wrong names are H1 (300 references; everyone else <= 55), and the gate's PASS does not cover
+this band because the labeled set is mostly clean faces. Hypothesis: for a junk face, the best of N
+chance similarities grows with N, so a person with many references wins on noise; top-3 keeps that
+bias. A reference cap per person tests it directly. No re-embed needed.
+
+```bash
+cd ~/vbb_reid_server && git pull && pip install -e '.[onnx,hf,dev]' --no-deps && pytest -q
+O=/vmdata/vbb_eval/out/v015; mkdir -p $O; A=/vmdata/vbb_eval/adj
+COMMON="--export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv --emb /vmdata/vbb_eval/emb --face-model RGB:m127.5"
+```
+
+1. The H1 test, on answers you already have: shadow WITHOUT the norm floor at three reference caps,
+scored on the low-norm set and the first 300. If the cap is the cause, the 19 wrong names should
+drop sharply at 50 / 25 without a floor.
+
+```bash
+echo '{"face_sim":0.4,"face_margin":0.05,"face_q_min":0.0,"body_enabled":false}' > $O/diag.json
+for R in 300 50 25; do
+  vbb-reid-server shadow $COMMON --facility 3 --thresholds $O/diag.json --max-refs $R --out $O/diag_refs$R >/dev/null
+  for SET in adjudication_sample_f3_lownorm adjudication_adjudication_f3_set1_sample; do
+    echo "max-refs $R, $SET:"; vbb-reid-server adjudicate-score --export /vmdata/vbb_eval/export \
+      --aliases /vmdata/vbb_eval/aliases.csv --answers $A/$SET.csv --labels $O/diag_refs$R/labels_3_*.csv \
+      | python3 -c "import json,sys; d=json.load(sys.stdin); print({k: d[k] for k in ('correct','wrong','abstain','stranger_false_accepts','precision_cp_lo')}, 'wrong:', d['wrong_ids'])"
+  done
+done
+```
+
+2. Guards pinned (probe norm floor 14, two-faces 0.25), similarity 0.40-0.50, per reference cap
+(pick R from step 1; run 300 too as the baseline):
+
+```bash
+for R in 300 <R>; do
+  vbb-reid-server eval $COMMON --facility 3 --grid configs/grids/face_v4.json --quality configs/quality/A_default.json \
+    --max-refs $R --fix min_face_norm=14 --fix two_face_ratio=0.25 --setup "A v4 refs $R" --out $O/eval_v4_refs$R 2>&1 \
+    | grep -A6 '^\[eval\] facility'
+done
+```
+
+3. Shadow at the chosen point, score both answer sets, then the set that actually measures what the
+machine would show: 200 NEW names (promote), uniform over all norms, none from earlier sets. The page
+carries both LAN crops next to it, so the folder can be copied to your Mac.
+
+```bash
+vbb-reid-server shadow $COMMON --facility 3 --point $O/eval_v4_refs<R>/point_3_temporal.json --out $O/shadow
+for SET in adjudication_sample_f3_lownorm adjudication_adjudication_f3_set1_sample; do
+  vbb-reid-server adjudicate-score --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv \
+    --answers $A/$SET.csv --labels $O/shadow/labels_3_*.csv > $O/score_$SET.json; done
+vbb-reid-server adjudicate-sample --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv --facility 3 \
+  --n 200 --named-by $O/shadow/labels_3_*.csv --relation promote --strata none \
+  --exclude $A/adjudication_adjudication_f3_set1_sample.csv $A/sample_f3_lownorm.csv --out $A/sample_f3_newnames.csv
+vbb-reid-server adjudicate-page --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv --facility 3 \
+  --sample $A/sample_f3_newnames.csv --lan-crops /vmdata/vbb_eval/crops --copy-crops --out $A/newnames/page.html
+```
+
+Copy the whole `$A/newnames/` folder to the Mac. **Send me** the step-1 lines, the step-2 VERDICT
+blocks, the two score files, and later the new-names answers. Reading the new-names result: 0 wrong
+in 200 gives a lower bound of 0.982; proving 0.99 at zero errors takes 368. Two hundred first is a
+cheap stop if errors appear; extend to 368+ if it is clean.
 
 ## 7. After that (I will send the exact commands with the results of step 6b)
 

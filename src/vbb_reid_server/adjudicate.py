@@ -26,39 +26,64 @@ def stratum(s: Sighting) -> str:
 
 
 def sample(ex: Export, facility: str, n: int, *, seed: int = 20261103, days: list[str] | None = None,
-           exclude: set[str] | None = None, only: set[str] | None = None) -> list[Sighting]:
-    """Equal share per stratum (board state x face/noface), spread evenly over days.
-    Already human-labeled sightings and ``exclude`` are skipped; ``only`` restricts the pool
-    (e.g. sightings a shadow run named from low-norm faces: a TARGETED set, whose precision
-    describes that band, not the population)."""
+           exclude: set[str] | None = None, only: set[str] | None = None, strata: str = "board") -> list[Sighting]:
+    """Draw ``n`` sightings, spread evenly over days.
+
+    ``strata="board"``: equal share per stratum (board state x face/noface); a stratum with too few
+    sightings passes its unused share to the others, so ``n`` is reached whenever the pool allows.
+    ``strata="none"``: uniform over the pool — the right design for "precision of what the machine
+    shows", where every machine output must be equally likely to be checked.
+    Already human-labeled sightings and ``exclude`` are skipped; ``only`` restricts the pool (a
+    TARGETED set describes that subset, not the population)."""
     rng = random.Random(seed)
     exclude = exclude or set()
     pool = [s for s in ex.sightings if s.facility_id == facility and s.human_state is None
             and s.image_url and s.sighting_id not in exclude and (days is None or s.day in days)
             and (only is None or s.sighting_id in only)]
+    key = (lambda s: "all") if strata == "none" else stratum
     by_stratum: dict[str, dict[str, list[Sighting]]] = defaultdict(lambda: defaultdict(list))
     for s in pool:
-        by_stratum[stratum(s)][s.day].append(s)
-    strata = sorted(by_stratum)
-    if not strata:
+        by_stratum[key(s)][s.day].append(s)
+    names = sorted(by_stratum)
+    if not names:
         return []
-    per = max(1, n // len(strata))
+    for st in names:
+        for d in by_stratum[st]:
+            rng.shuffle(by_stratum[st][d])
+
+    def take_one(st: str, cursor: dict[str, int]) -> Sighting | None:
+        day_keys = sorted(by_stratum[st])
+        for _ in range(len(day_keys)):
+            d = day_keys[cursor[st] % len(day_keys)]
+            cursor[st] += 1
+            if by_stratum[st][d]:
+                return by_stratum[st][d].pop()
+        return None
+
+    cursor = {st: 0 for st in names}
+    quota = {st: n // len(names) for st in names}
+    for st in names[: n - sum(quota.values())]:
+        quota[st] += 1
     picked: list[Sighting] = []
-    for st in strata:
-        days_map = by_stratum[st]
-        day_keys = sorted(days_map)
-        for d in day_keys:
-            rng.shuffle(days_map[d])
-        taken = 0
-        while taken < per and any(days_map[d] for d in day_keys):
-            for d in day_keys:
-                if taken >= per:
-                    break
-                if days_map[d]:
-                    picked.append(days_map[d].pop())
-                    taken += 1
+    for st in names:
+        for _ in range(quota[st]):
+            x = take_one(st, cursor)
+            if x is None:
+                break
+            picked.append(x)
+    while len(picked) < n:  # hand unused shares to the strata that still have sightings
+        progressed = False
+        for st in names:
+            if len(picked) >= n:
+                break
+            x = take_one(st, cursor)
+            if x is not None:
+                picked.append(x)
+                progressed = True
+        if not progressed:
+            break
     rng.shuffle(picked)
-    return picked[:n] if len(picked) > n else picked
+    return picked
 
 
 def write_sample(rows: list[Sighting], path: Path) -> None:
@@ -185,9 +210,13 @@ def _script_json(obj) -> str:
 
 
 def write_page(ex: Export, facility: str, sample_ids: list[str], path: Path, *, set_id: str,
-               lan_root: Path | None = None) -> None:
-    """Self-contained page. Crops: the CDN best crop, plus the LAN copies when ``lan_root``
-    is given (referenced by absolute ``file://`` path — open the page on the GPU host)."""
+               lan_root: Path | None = None, copy_crops: bool = False) -> None:
+    """Self-contained page. Crops: every LAN copy when ``lan_root`` is given, else the CDN best crop.
+    ``copy_crops`` copies the LAN crops into ``<page folder>/crops/`` and links them relatively, so
+    the folder can be moved to another machine (``file://`` links only work on the GPU host)."""
+    import shutil
+
+    from .crops import CropStore
     by_id = {s.sighting_id: s for s in ex.sightings}
     roster = ex.roster(facility)
     strips = person_strips(ex, facility)
@@ -195,20 +224,24 @@ def write_page(ex: Export, facility: str, sample_ids: list[str], path: Path, *, 
     # never name them, so the page does not offer them either (answer "stranger" or "can't tell").
     people = [{"key": k, "name": ex.names.get(k, k[-6:]), "photos": strips[k]}
               for k in sorted(roster) if strips.get(k)]
+    store = CropStore(lan_root, None, fetch=False) if lan_root is not None else None
+    crop_dir = path.parent / "crops"
     items = []
     for sid in sample_ids:
         s = by_id.get(sid)
         if s is None:
             continue
         crops = []
-        if lan_root is not None:
-            d = None
-            for day in (s.day,):
-                cand = Path(lan_root) / s.did / day / sid
-                if cand.is_dir():
-                    d = cand
-            if d is not None:
-                crops = [f"file://{p.resolve()}" for p in sorted(d.glob("*.jpg"))]
+        if store is not None:
+            refs = store.lan_crops(s)
+            if copy_crops and refs:
+                crop_dir.mkdir(parents=True, exist_ok=True)
+                for r in refs:
+                    dest = crop_dir / f"{sid}_{r.index}.jpg"
+                    shutil.copyfile(r.path, dest)
+                    crops.append(f"crops/{dest.name}")
+            else:
+                crops = [f"file://{r.path.resolve()}" for r in refs]
         if not crops and s.image_url:
             crops = [s.image_url]
         items.append({"sighting_id": sid, "day": s.day, "crops": crops})
@@ -318,4 +351,6 @@ def score(ex: Export, answers: dict[str, str], labels: dict[str, MachineLabel] |
         "by_stratum": {k: {"n": t.n, "population": pop.get(k, 0), "precision": t.precision, "coverage": t.coverage}
                        for k, t in sorted(by_stratum.items())},
         "wrong_ids": total.wrong_ids,
+        "note": ("weighted_* re-weight a board-stratified sample of ALL unlabeled sightings; for a targeted or "
+                 "uniform sample of machine outputs, read precision / precision_cp_lo directly"),
     }

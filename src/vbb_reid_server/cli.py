@@ -115,6 +115,7 @@ def cmd_eval(args) -> None:
     grid = load_grid(args.grid)
     if not body_id:
         grid["body_enabled"] = [False]
+    fixed = _parse_fix(args.fix)
     out = Path(args.out)
     setup = args.setup or f"{(face_id or '-').split('|')[-1]} + {body_id or '-'}"
     for fac in args.facility:
@@ -125,7 +126,7 @@ def cmd_eval(args) -> None:
             write_curve(rows, out / "curve.csv")
             gate = dict(min_precision_lo=args.min_precision_lo, max_loo_fa=args.max_loo_fa,
                         min_labeled=args.min_labeled, gate=args.gate)
-            point = operating_point(rows, **gate)
+            point = operating_point([r for r in rows if _matches(r, fixed)], **gate)
             text = summarize(rows, point)
             if point is None and rows:
                 verdicts = [(r, *verdict(r, **gate)) for r in rows]
@@ -162,6 +163,28 @@ def cmd_eval(args) -> None:
                 pth = out / f"point_{fac}_{mode}.json"
                 write_point(point, pth, ref_policy=policy, quality=quality)
                 print(f"[eval] operating point written to {pth}")
+
+
+def _parse_fix(items: list[str] | None) -> dict:
+    """``--fix key=value``: the operating point is chosen only among rows with these settings
+    (the sweep still runs and is written in full). Values are JSON (null, 0.25, true)."""
+    known = {f.name for f in fields(Thresholds)}
+    out = {}
+    for it in items or []:
+        if "=" not in it:
+            raise SystemExit(f"--fix wants key=value, got {it!r}")
+        k, v = it.split("=", 1)
+        if k not in known:
+            raise SystemExit(f"unknown --fix key {k!r}; known: {', '.join(sorted(known))}")
+        out[k] = json.loads(v)
+    return out
+
+
+def _matches(row: dict, fixed: dict) -> bool:
+    if not fixed:
+        return True
+    th = json.loads(row["thresholds"])
+    return all(th.get(k) == v for k, v in fixed.items())
 
 
 def cmd_shadow(args) -> None:
@@ -203,8 +226,11 @@ def cmd_adj_sample(args) -> None:
         for p in args.named_by:
             with open(p, newline="", encoding="utf-8") as fh:
                 named |= {r["sighting_id"] for r in csv.DictReader(fh)
-                          if r.get("state") == "known" and str(r.get("human_labeled", "0")) in ("0", "")}
+                          if r.get("state") == "known" and str(r.get("human_labeled", "0")) in ("0", "")
+                          and (args.relation is None or r.get("relation") == args.relation)}
         only = named
+    elif args.relation:
+        raise SystemExit("--relation needs --named-by")
     if args.norm_below is not None or args.norm_at_least is not None:
         if not (args.emb and args.face_model):
             raise SystemExit("--norm-below / --norm-at-least need --emb and --face-model")
@@ -219,7 +245,8 @@ def cmd_adj_sample(args) -> None:
                 best[str(sid)] = max(best.get(str(sid), float("-inf")), float(nrm))
         band = {sid for sid, nrm in best.items() if lo <= nrm < hi}
         only = band if only is None else (only & band)
-    rows = sample(ex, args.facility, args.n, seed=args.seed, days=days, exclude=exclude, only=only)
+    rows = sample(ex, args.facility, args.n, seed=args.seed, days=days, exclude=exclude, only=only,
+                  strata=args.strata)
     write_sample(rows, Path(args.out))
     print(f"[adjudicate] {len(rows)} sightings -> {args.out}; strata {dict(Counter(r.board_state + '/' + ('face' if r.crop_is_face else 'noface') for r in rows))}")
 
@@ -229,7 +256,7 @@ def cmd_adj_page(args) -> None:
     ex = load_export(args.export, args.aliases)
     ids = read_sample(Path(args.sample))
     write_page(ex, args.facility, ids, Path(args.out), set_id=Path(args.sample).stem,
-               lan_root=Path(args.lan_crops) if args.lan_crops else None)
+               lan_root=Path(args.lan_crops) if args.lan_crops else None, copy_crops=args.copy_crops)
     print(f"[adjudicate] page with {len(ids)} items -> {args.out}")
 
 
@@ -378,6 +405,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--max-loo-fa", type=float, default=0.005,
                     help="gate: upper bound on the leave-one-person-out false-accept rate")
     sp.add_argument("--min-labeled", type=int, default=50, help="gate: minimum labels the machine gave")
+    sp.add_argument("--fix", action="append", metavar="KEY=VALUE",
+                    help="choose the operating point only among rows with this setting (repeatable), "
+                         "e.g. --fix two_face_ratio=0.25 --fix min_face_norm=14")
     sp.add_argument("--gate", choices=["promote", "all"], default="promote",
                     help="gate on promotions (what v1 shows) or on every labeled target")
     sp.add_argument("--no-loo", action="store_true")
@@ -413,6 +443,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--seed", type=int, default=20261103)
     sp.add_argument("--exclude", nargs="*", help="earlier sample CSVs to skip")
     sp.add_argument("--named-by", nargs="*", help="only sightings these shadow labels CSVs named (state=known)")
+    sp.add_argument("--relation", choices=["promote", "agree"], help="with --named-by: only new names / only agreements")
+    sp.add_argument("--strata", choices=["board", "none"], default="board",
+                    help="board: equal share per board state x face/no-face; none: uniform over the pool")
     sp.add_argument("--norm-below", type=float, help="only sightings whose best face has a raw norm below this")
     sp.add_argument("--norm-at-least", type=float, help="only sightings whose best face has a raw norm at least this")
     sp.add_argument("--emb", help="embedding cache (for the norm filters)")
@@ -425,6 +458,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--facility", required=True)
     sp.add_argument("--sample", required=True)
     sp.add_argument("--lan-crops")
+    sp.add_argument("--copy-crops", action="store_true",
+                    help="copy the LAN crops next to the page (relative links; the folder can be moved)")
     sp.add_argument("--out", required=True)
     sp.set_defaults(fn=cmd_adj_page)
 
