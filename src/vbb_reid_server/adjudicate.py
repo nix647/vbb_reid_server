@@ -26,13 +26,16 @@ def stratum(s: Sighting) -> str:
 
 
 def sample(ex: Export, facility: str, n: int, *, seed: int = 20261103, days: list[str] | None = None,
-           exclude: set[str] | None = None) -> list[Sighting]:
+           exclude: set[str] | None = None, only: set[str] | None = None) -> list[Sighting]:
     """Equal share per stratum (board state x face/noface), spread evenly over days.
-    Already human-labeled sightings and ``exclude`` are skipped."""
+    Already human-labeled sightings and ``exclude`` are skipped; ``only`` restricts the pool
+    (e.g. sightings a shadow run named from low-norm faces: a TARGETED set, whose precision
+    describes that band, not the population)."""
     rng = random.Random(seed)
     exclude = exclude or set()
     pool = [s for s in ex.sightings if s.facility_id == facility and s.human_state is None
-            and s.image_url and s.sighting_id not in exclude and (days is None or s.day in days)]
+            and s.image_url and s.sighting_id not in exclude and (days is None or s.day in days)
+            and (only is None or s.sighting_id in only)]
     by_stratum: dict[str, dict[str, list[Sighting]]] = defaultdict(lambda: defaultdict(list))
     for s in pool:
         by_stratum[stratum(s)][s.day].append(s)

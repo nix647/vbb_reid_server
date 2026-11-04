@@ -1,0 +1,9 @@
+{
+  "_comment": "Face-only, policy A, around the stable region: probe norm floor x two-faces rule (null = off). 3 x 3 x 2 x 4 = 72 rows. Run it twice: --ref-min-norm 0 and 14 (reference filters are not grid keys).",
+  "face_sim": [0.35, 0.40, 0.45],
+  "face_margin": [0.05, 0.10, 0.15],
+  "face_q_min": [0.0],
+  "two_face_ratio": [null, 0.25],
+  "min_face_norm": [0.0, 12.0, 14.0, 16.0],
+  "body_enabled": [false]
+}

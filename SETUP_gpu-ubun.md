@@ -51,7 +51,7 @@ echo 'export HF_HOME=/vmdata/vbb_eval/hf' >> ~/.bashrc && export HF_HOME=/vmdata
 cd ~/vbb_reid_server && pytest -q && vbb-reid-server doctor
 ```
 
-Expected: `62 passed` (0.1.3); `onnxruntime ... providers [...'CUDAExecutionProvider'...]`;
+Expected: `66 passed` (0.1.4); `onnxruntime ... providers [...'CUDAExecutionProvider'...]`;
 `torch ... cuda available=True, device NVIDIA GeForce RTX 4070 Ti SUPER`.
 If `CUDAExecutionProvider` is missing, the CPU build may have been installed next to the GPU build
 (0.1.0/0.1.1's `dev` extra pulled it in; both provide the same module). Fix and check again:
@@ -309,6 +309,75 @@ done
 their VERDICT lines; and both `adjudicate-score` results. Keep using the as-exported export for
 these runs (your reviewed copies were a good diagnostic; the guards above are meant to make them
 unnecessary).
+
+## 6e. The corrected sweep, the margin question, and a targeted check of low-norm names (0.1.4)
+
+0.1.3's `eval` cached face scores under a key that missed `two_face_ratio` and `min_face_norm`, so
+sweeps of those two settings reused unguarded scores (found by the owner on 2026-11-05). 0.1.4
+makes face scoring read only a settings object that is itself the cache key. No re-embed needed.
+Policy A from here on (A and B did not differ on any check; A is the closer port of the board).
+
+```bash
+cd ~/vbb_reid_server && git pull && pip install -e '.[onnx,hf,dev]' --no-deps && pytest -q
+O=/vmdata/vbb_eval/out/v014; mkdir -p $O
+COMMON="--export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv --emb /vmdata/vbb_eval/emb --face-model RGB:m127.5"
+```
+
+1. Probe norm floor x two-faces rule, with and without a reference norm floor:
+
+```bash
+for R in 0 14; do
+  vbb-reid-server eval $COMMON --facility 3 2 --grid configs/grids/face_v3.json \
+    --quality configs/quality/A_default.json --ref-min-norm $R --setup "A v3 refnorm $R" --out $O/eval_refnorm$R 2>&1 \
+    | grep -A12 '^\[eval\] facility'
+done
+python3 - $O <<'PY'
+import csv, glob, sys
+for f in sorted(glob.glob(sys.argv[1] + "/eval_refnorm*/curve.csv")):
+    for r in csv.DictReader(open(f)):
+        if r["facility"] == "3" and r["face_sim"] == "0.4" and r["face_margin"] == "0.05":
+            print(f.split("/")[-2], r["refs_mode"], "two_face", r["two_face_ratio"] or "off", "norm", r["min_face_norm"],
+                  "| labeled", r["promote_labeled"], "wrong", r["wrong"], "flagged", r["flagged"], "cp_lo", r["promote_cp_lo"],
+                  "cov", r["promote_coverage"], "fa_hi", r["loo_fa_cp_hi"], "unlabeled", r["unlabeled_promotions"])
+PY
+```
+
+2. Is B's reference sensitivity really B, or the margin it picked (0.15)? Policy A at B's lodo setting
+on your two reviewed copies of the export:
+
+```bash
+echo '{"face_sim":[0.35],"face_margin":[0.15],"face_q_min":[0.0],"body_enabled":[false]}' > $O/one.json
+for X in fix fix_bad; do
+  vbb-reid-server eval --export <your $X export copy> --aliases /vmdata/vbb_eval/aliases.csv --emb /vmdata/vbb_eval/emb \
+    --face-model RGB:m127.5 --facility 3 --refs-mode lodo --grid $O/one.json --quality configs/quality/A_default.json \
+    --out $O/margin_$X >/dev/null
+  python3 -c "import csv,sys; r=list(csv.DictReader(open(sys.argv[1])))[-1]; print(sys.argv[2], 'labeled', r['promote_labeled'], 'wrong', r['wrong'], 'unlabeled_promotions', r['unlabeled_promotions'])" $O/margin_$X/curve.csv $X
+done
+```
+
+3. Look at the five two-person answers and the unreviewed lodo error:
+
+```bash
+vbb-reid-server inspect $COMMON --facility 3 --point $O/eval_refnorm0/point_3_temporal.json \
+  --sightings cdcc40d83bda,9354311a2579,885436f94353,620f2f2bbf74,4ff683ec05a8,36aed033c5b4
+```
+
+4. Shadow at the corrected temporal point, score it, and draw a TARGETED set: 100 sightings the
+machine named from faces with norm below 16 (the band where your hair and back-of-head boxes sit).
+Label it like the first set; its precision says whether low-norm names can be trusted.
+
+```bash
+vbb-reid-server shadow $COMMON --facility 3 --point $O/eval_refnorm0/point_3_temporal.json --out $O/shadow
+vbb-reid-server adjudicate-score --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv \
+  --answers /vmdata/vbb_eval/adj/adjudication_adjudication_f3_set1_sample.csv --labels $O/shadow/labels_3_*.csv | tee $O/adjscore.json
+vbb-reid-server adjudicate-sample $COMMON --facility 3 --n 100 --named-by $O/shadow/labels_3_*.csv --norm-below 16 \
+  --exclude /vmdata/vbb_eval/adj/adjudication_f3_set1_sample.csv --out /vmdata/vbb_eval/adj/sample_f3_lownorm.csv
+vbb-reid-server adjudicate-page --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_eval/aliases.csv --facility 3 \
+  --sample /vmdata/vbb_eval/adj/sample_f3_lownorm.csv --lan-crops /vmdata/vbb_eval/crops --out /vmdata/vbb_eval/adj/page_f3_lownorm.html
+```
+
+**Send me**: the VERDICT blocks and the printed rows of step 1, the two lines of step 2, the
+`inspect` output, `adjscore.json`, and — once labeled — the low-norm answers CSV.
 
 ## 7. After that (I will send the exact commands with the results of step 6b)
 

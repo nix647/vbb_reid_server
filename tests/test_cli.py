@@ -71,3 +71,21 @@ def test_inspect_prints_measures_scores_and_decision(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "tA0" in out and "norm=" in out and "reference-usable=" in out and "face scores:" in out
     assert "decision:" in out and "nope: not a facility 3 sighting" in out
+
+
+def test_targeted_adjudication_sample_by_machine_name_and_norm(tmp_path):
+    import csv as csv_
+    exp, emb = build(tmp_path)
+    labels = tmp_path / "labels.csv"
+    with labels.open("w", newline="") as fh:
+        w = csv_.writer(fh)
+        w.writerow(["sighting_id", "state", "human_labeled"])
+        w.writerow(["unl0", "known", "0"])
+    out = tmp_path / "s.csv"
+    main(["adjudicate-sample", "--export", str(exp), "--facility", "3", "--n", "10", "--named-by", str(labels),
+          "--norm-below", "25", "--emb", str(emb), "--face-model", FACE_ID, "--out", str(out)])
+    assert [r["sighting_id"] for r in csv_.DictReader(out.open())] == ["unl0"]
+    main(["adjudicate-sample", "--export", str(exp), "--facility", "3", "--n", "10", "--named-by", str(labels),
+          "--norm-below", "15", "--emb", str(emb), "--face-model", FACE_ID, "--out", str(out)])
+    assert list(csv_.DictReader(out.open())) == []  # the helper's faces all have norm 20
+

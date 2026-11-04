@@ -85,14 +85,32 @@ def report(ws: Workspace, facility: str, days: list[str], *, bins: int = 5, far:
         if not np.isfinite(x).all():  # e.g. norm from a model that does not expose it
             continue
         pair_x = reduce(x[iu], x[ju])
-        values = np.unique(pair_x)
+        values, counts = np.unique(pair_x, return_counts=True)
         if len(values) <= bins:  # few distinct values: one bin per value
             which = np.searchsorted(values, pair_x)
             ranges = [(v, v) for v in values]
         else:
-            edges = np.unique(np.quantile(pair_x, np.linspace(0, 1, bins + 1)))
-            which = np.clip(np.searchsorted(edges, pair_x, side="right") - 1, 0, len(edges) - 2)
-            ranges = [(edges[b], edges[b + 1]) for b in range(len(edges) - 1)]
+            # A value holding a large share (e.g. second_ratio = 0 for "alone in the crop") gets its
+            # own bin; quantile bins over the rest. Otherwise the bins collapse into one.
+            top = int(np.argmax(counts))
+            if counts[top] >= len(pair_x) / bins:
+                spike = values[top]
+                rest = pair_x[pair_x != spike]
+                edges = np.unique(np.quantile(rest, np.linspace(0, 1, bins))) if rest.size else np.array([])
+                which = np.full(pair_x.shape, -1)
+                which[pair_x == spike] = 0
+                ranges = [(spike, spike)]
+                if len(edges) >= 2:
+                    m = pair_x != spike
+                    which[m] = 1 + np.clip(np.searchsorted(edges, pair_x[m], side="right") - 1, 0, len(edges) - 2)
+                    ranges += [(edges[b], edges[b + 1]) for b in range(len(edges) - 1)]
+                elif rest.size:
+                    which[pair_x != spike] = 1
+                    ranges.append((rest.min(), rest.max()))
+            else:
+                edges = np.unique(np.quantile(pair_x, np.linspace(0, 1, bins + 1)))
+                which = np.clip(np.searchsorted(edges, pair_x, side="right") - 1, 0, len(edges) - 2)
+                ranges = [(edges[b], edges[b + 1]) for b in range(len(edges) - 1)]
         for b, (lo, hi) in enumerate(ranges):
             m = which == b
             g, i_ = sims[m & same], sims[m & ~same]

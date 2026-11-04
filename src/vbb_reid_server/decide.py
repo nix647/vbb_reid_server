@@ -17,7 +17,7 @@ The machine never emits ``stranger`` or ``uncertain``.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Callable
 
 import numpy as np
@@ -56,6 +56,23 @@ class Thresholds:
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+    def face_params(self) -> "FaceParams":
+        return FaceParams(**{f.name: getattr(self, f.name) for f in fields(FaceParams)})
+
+
+@dataclass(frozen=True)
+class FaceParams:
+    """EVERYTHING :func:`face_scores` may read. It is hashable and is the evaluation's cache key
+    for face scores: a setting face scoring uses but this class lacks cannot be read at all, so it
+    can never be silently missing from the key (0.1.3 bug: two_face_ratio and min_face_norm sweeps
+    reused unguarded scores)."""
+    face_q_min: float
+    face_min_px: float
+    topk: int
+    min_face_norm: float
+    two_face_ratio: float | None
+    two_face_det: float
 
 
 @dataclass
@@ -109,11 +126,12 @@ def _unpack(face: tuple) -> tuple[int, np.ndarray, float, float, float, float, f
     return tuple(face)  # type: ignore[return-value]
 
 
-def face_scores(probe_faces: dict[str, list[tuple]], refs, th: Thresholds) -> FaceScores:
+def face_scores(probe_faces: dict[str, list[tuple]], refs, th: "Thresholds | FaceParams") -> FaceScores:
     """probe_faces: sid -> [(crop_idx, unit vec, qf, face_h)]; refs: key -> (R, D) unit vecs,
     optionally a ``pipeline.Refs`` grouping rows by labeled sighting. A probe crop's score for
     a person is the mean of its top-k matches over that person's labeled SIGHTINGS (each
     sighting contributes its best crop), so near-duplicate crops of one track count once."""
+    th = th.face_params() if isinstance(th, Thresholds) else th  # only FaceParams fields are readable below
     persons = sorted(refs)
     starts = {p: _starts_of(refs, p) for p in persons}
     n_refs = np.array([len(starts[p]) for p in persons], dtype=int)  # labeled sightings, not crops

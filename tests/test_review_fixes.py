@@ -275,3 +275,60 @@ def test_verdict_separates_not_enough_evidence_from_failure():
     bad = dict(row, promote_labeled=300, promote_precision=0.95, promote_cp_lo=0.91)
     assert verdict(bad, min_precision_lo=0.99, max_loo_fa=0.005, min_labeled=50)[0] == "fail"
     assert needed_trials(285, 300, rate_bound=0.99, upper=False) is None  # 95 % never reaches 0.99
+
+
+# --- 2026-11-05 owner finding: grid sweeps of face-scoring settings had no effect -------------
+
+def test_a_grid_over_face_scoring_settings_gives_different_rows(tmp_path):
+    """The per-day face-score cache keyed only some settings, so two_face_ratio and
+    min_face_norm sweeps silently reused the first (unguarded) scores."""
+    from vbb_reid_server.evaluate import evaluate_facility
+    day = "2026-10-20"
+    rows = []
+    for i in range(6):
+        rows.append({"sighting_id": f"r{i}", "facility_id": "3", "capture_ts": ms("2026-10-19", 9 + i),
+                     "corrected_state": "known", "corrected_at": "x", "corrected_person_id": "pA" if i % 2 else "pB",
+                     "corrected_ts": ms("2026-10-19", 20)})
+    write_export(tmp_path / "e", rows + [
+        {"sighting_id": "two", "facility_id": "3", "capture_ts": ms(day, 9), "corrected_state": "known",
+         "corrected_at": "x", "corrected_person_id": "pA", "corrected_ts": ms(day, 12)},
+        {"sighting_id": "weak", "facility_id": "3", "capture_ts": ms(day, 10), "corrected_state": "known",
+         "corrected_at": "x", "corrected_person_id": "pA", "corrected_ts": ms(day, 12)}],
+        [("pA", "3", "visitor"), ("pB", "3", "visitor")], facilities=(("3", "2"),))
+    ex = load_export(tmp_path / "e")
+    emb = tmp_path / "emb"
+    write_face_cache(emb, "3", "2026-10-19", [(f"r{i}", 0, near(basis(0 if i % 2 else 1), 0.05, RNG), 0.9, 60.0)
+                                              for i in range(6)])
+    write_face_cache(emb, "3", day, [("two", 0, near(basis(0), 0.05, RNG), 0.9, 60.0),
+                                     ("weak", 0, near(basis(0), 0.05, RNG), 0.9, 60.0)])
+    import numpy as np_
+    from vbb_reid_server.embed import _face_path
+    f = _face_path(emb, FACE_ID, "3", day)
+    z = dict(np_.load(f, allow_pickle=True))
+    z["second_ratio"] = np_.array([0.36, 0.0])
+    z["second_det"] = np_.array([0.84, 0.0])
+    z["norm"] = np_.array([21.0, 11.0])
+    np_.savez(f, **z)
+    ws = Workspace(ex, emb, FACE_ID, None)
+    grid = {"face_sim": [0.5], "face_margin": [0.1], "face_q_min": [0.0], "body_enabled": [False],
+            "two_face_ratio": [None, 0.25], "min_face_norm": [0.0, 14.0]}
+    res = evaluate_facility(ws, "3", refs_mode="temporal", grid=grid, base=Thresholds(min_refs=1),
+                            days=[day], loo=False, log=lambda *_: None)
+    got = {(r.th.two_face_ratio, r.th.min_face_norm): (r.total.correct, r.total.flagged) for r in res}
+    assert got[(None, 0.0)] == (2, 0)
+    assert got[(0.25, 0.0)] == (1, 1)   # "two" flagged mixed
+    assert got[(None, 14.0)] == (1, 0)  # "weak" not used
+    assert got[(0.25, 14.0)] == (0, 1)
+
+
+def test_face_scores_reads_nothing_outside_face_params():
+    """Static guard for the cache-key bug class: every `th.<x>` inside face_scores must be a
+    FaceParams field (FaceParams is the evaluation's cache key)."""
+    import ast
+    import inspect as insp
+    from dataclasses import fields as dfields
+    import vbb_reid_server.decide as d
+    fn = next(n for n in ast.walk(ast.parse(insp.getsource(d))) if isinstance(n, ast.FunctionDef) and n.name == "face_scores")
+    used = {n.attr for n in ast.walk(fn)
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "th"} - {"face_params"}
+    assert used and used <= {f.name for f in dfields(d.FaceParams)}

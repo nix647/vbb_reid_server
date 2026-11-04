@@ -110,7 +110,8 @@ def cmd_eval(args) -> None:
     quality = QualityPolicy.from_file(args.quality)
     ws = Workspace(ex, args.emb, face_id, body_id, quality)
     base = _thresholds(args)
-    policy = RefPolicy(window_days=args.window_days, ref_q_min=args.ref_q_min, max_refs=args.max_refs)
+    policy = RefPolicy(window_days=args.window_days, ref_q_min=args.ref_q_min, max_refs=args.max_refs,
+                       ref_min_norm=args.ref_min_norm, ref_two_face_ratio=args.ref_two_face_ratio)
     grid = load_grid(args.grid)
     if not body_id:
         grid["body_enabled"] = [False]
@@ -177,7 +178,7 @@ def cmd_shadow(args) -> None:
         th = strict_replace(Thresholds(), pt["thresholds"], "Thresholds")
         quality = strict_replace(QualityPolicy(), pt.get("quality", {}), "QualityPolicy")
         policy = strict_replace(policy, pt.get("ref_policy", {}), "RefPolicy")
-    for name in ("window_days", "ref_q_min", "max_refs"):
+    for name in ("window_days", "ref_q_min", "max_refs", "ref_min_norm", "ref_two_face_ratio"):
         if getattr(args, name) is not None:
             policy = replace(policy, **{name: getattr(args, name)})
     ws = Workspace(ex, args.emb, face_id, body_id, quality)
@@ -196,7 +197,29 @@ def cmd_adj_sample(args) -> None:
         with open(p, newline="", encoding="utf-8") as fh:
             exclude |= {r["sighting_id"] for r in csv.DictReader(fh)}
     days = args.days.split(",") if args.days else None
-    rows = sample(ex, args.facility, args.n, seed=args.seed, days=days, exclude=exclude)
+    only = None
+    if args.named_by:
+        named: set[str] = set()
+        for p in args.named_by:
+            with open(p, newline="", encoding="utf-8") as fh:
+                named |= {r["sighting_id"] for r in csv.DictReader(fh)
+                          if r.get("state") == "known" and str(r.get("human_labeled", "0")) in ("0", "")}
+        only = named
+    if args.norm_below is not None or args.norm_at_least is not None:
+        if not (args.emb and args.face_model):
+            raise SystemExit("--norm-below / --norm-at-least need --emb and --face-model")
+        face_id = _ids_from_cache(args.emb, "face", args.face_model)
+        ws = Workspace(ex, args.emb, face_id, None)
+        lo = args.norm_at_least if args.norm_at_least is not None else float("-inf")
+        hi = args.norm_below if args.norm_below is not None else float("inf")
+        best: dict[str, float] = {}
+        for d in (days or ex.days(args.facility)):
+            ft = ws.face_table(args.facility, d)
+            for sid, nrm in zip(ft.sighting_id, ft.norm):
+                best[str(sid)] = max(best.get(str(sid), float("-inf")), float(nrm))
+        band = {sid for sid, nrm in best.items() if lo <= nrm < hi}
+        only = band if only is None else (only & band)
+    rows = sample(ex, args.facility, args.n, seed=args.seed, days=days, exclude=exclude, only=only)
     write_sample(rows, Path(args.out))
     print(f"[adjudicate] {len(rows)} sightings -> {args.out}; strata {dict(Counter(r.board_state + '/' + ('face' if r.crop_is_face else 'noface') for r in rows))}")
 
@@ -347,6 +370,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--window-days", type=int, default=60)
     sp.add_argument("--ref-q-min", type=float, default=0.40)
     sp.add_argument("--max-refs", type=int, default=300)
+    sp.add_argument("--ref-min-norm", type=float, default=0.0, help="reference faces need this raw feature norm")
+    sp.add_argument("--ref-two-face-ratio", type=float, default=None,
+                    help="skip reference crops with a second face at least this share of the chosen one")
     sp.add_argument("--min-precision-lo", type=float, default=0.99,
                     help="gate: lower bound (day bootstrap AND exact binomial) on precision")
     sp.add_argument("--max-loo-fa", type=float, default=0.005,
@@ -370,6 +396,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--window-days", type=int)
     sp.add_argument("--ref-q-min", type=float)
     sp.add_argument("--max-refs", type=int)
+    sp.add_argument("--ref-min-norm", type=float)
+    sp.add_argument("--ref-two-face-ratio", type=float)
     sp.add_argument("--labels-until", choices=["run", "all"], default="run",
                     help="run (default): only labels that existed at that night's run; all: every label in the "
                          "export (debugging only - it leaks the future)")
@@ -384,6 +412,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--days")
     sp.add_argument("--seed", type=int, default=20261103)
     sp.add_argument("--exclude", nargs="*", help="earlier sample CSVs to skip")
+    sp.add_argument("--named-by", nargs="*", help="only sightings these shadow labels CSVs named (state=known)")
+    sp.add_argument("--norm-below", type=float, help="only sightings whose best face has a raw norm below this")
+    sp.add_argument("--norm-at-least", type=float, help="only sightings whose best face has a raw norm at least this")
+    sp.add_argument("--emb", help="embedding cache (for the norm filters)")
+    sp.add_argument("--face-model", help="cached face model (for the norm filters)")
     sp.add_argument("--out", required=True)
     sp.set_defaults(fn=cmd_adj_sample)
 

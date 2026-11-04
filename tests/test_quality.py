@@ -83,3 +83,32 @@ def test_quality_report_separates_good_from_bad_faces(tmp_path):
     out = report(ws, "3", [day], bins=2, far=0.01, log=lambda *_: None)
     det_rows = [r for r in out if r["measure"] == "det"]
     assert det_rows[-1]["tar_at_far"] > det_rows[0]["tar_at_far"]  # good faces match, bad ones do not
+
+
+def test_quality_report_gives_a_zero_heavy_measure_its_own_bin(tmp_path):
+    """second_ratio is 0 for almost every face (alone in the crop); quantile bins collapsed it
+    into one band on gpu-ubun 2026-11-05. The spike must get its own bin."""
+    rng = np.random.default_rng(5)
+    rows, face_rows = [], []
+    for i in range(40):
+        who = "pA" if i % 2 else "pB"
+        sid = f"s{i}"
+        rows.append({"sighting_id": sid, "facility_id": "3", "capture_ts": 1792900000000 + i,
+                     "corrected_state": "known", "corrected_at": "x", "corrected_person_id": who,
+                     "corrected_ts": 1792900100000})
+        face_rows.append((sid, 0, near(basis(0 if who == "pA" else 1), 0.05, rng), 0.9, 80.0))
+    exp = tmp_path / "export"
+    write_export(exp, rows, [("pA", "3", "visitor"), ("pB", "3", "visitor")], facilities=(("3", "2"),))
+    ex = load_export(exp)
+    day = ex.days("3")[0]
+    write_face_cache(tmp_path / "emb", "3", day, face_rows)
+    from vbb_reid_server.embed import _face_path
+    f = _face_path(tmp_path / "emb", FACE_ID, "3", day)
+    z = dict(np.load(f, allow_pickle=True))
+    sr = np.zeros(40)
+    sr[:8] = np.linspace(0.15, 0.85, 8)  # more distinct values than bins: the quantile path
+    z["second_ratio"] = sr
+    np.savez(f, **z)
+    out = report(Workspace(ex, tmp_path / "emb", FACE_ID, None), "3", [day], bins=5, far=0.01, log=lambda *_: None)
+    sr_rows = [r for r in out if r["measure"] == "second_ratio"]
+    assert sr_rows[0]["lo"] == sr_rows[0]["hi"] == 0.0 and len(sr_rows) >= 2

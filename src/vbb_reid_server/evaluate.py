@@ -116,14 +116,15 @@ def evaluate_facility(ws: Workspace, facility: str, *, refs_mode: str = "tempora
                         bucket.add("abstain")
                 r.unlabeled_pool += len(unlabeled_pool)
             continue
-        # face_scores depends on the quality floor, face size floor and top-k, which a grid may vary:
-        # compute it once per distinct (face_q_min, face_min_px, topk).
+        # Face scores are computed once per distinct FaceParams (everything face_scores can read)
+        # and reference set; the key cannot miss a setting (see decide.FaceParams).
         fs_cache: dict[tuple, object] = {}
 
         def fs_for(th: Thresholds, refs_used: dict, tag: str):
-            key = (tag, th.face_q_min, th.face_min_px, th.topk)
+            params = th.face_params()
+            key = (tag, params)
             if key not in fs_cache:
-                fs_cache[key] = face_scores(probe_faces, refs_used, th)
+                fs_cache[key] = face_scores(probe_faces, refs_used, params)
             return fs_cache[key]
 
         loo_sets = []
@@ -169,7 +170,8 @@ def evaluate_facility(ws: Workspace, facility: str, *, refs_mode: str = "tempora
 
 
 CURVE_FIELDS = [
-    "setup", "refs_mode", "facility", "combo", "face_sim", "face_margin", "face_q_min", "body_enabled", "body_link",
+    "setup", "refs_mode", "facility", "combo", "face_sim", "face_margin", "face_q_min", "min_face_norm",
+    "two_face_ratio", "topk", "body_enabled", "body_link",
     "n_targets", "correct", "wrong", "flagged", "abstain", "precision", "precision_lo95_days", "precision_cp_lo",
     "coverage",
     "promote_n", "promote_labeled", "promote_precision", "promote_lo95_days", "promote_cp_lo", "promote_coverage",
@@ -196,6 +198,8 @@ def curve_rows(results: list[ComboResult], setup: str, refs_mode: str, facility:
         rows.append({
             "setup": setup, "refs_mode": refs_mode, "facility": facility, "combo": i,
             "face_sim": r.th.face_sim, "face_margin": r.th.face_margin, "face_q_min": r.th.face_q_min,
+            "min_face_norm": r.th.min_face_norm, "two_face_ratio": "" if r.th.two_face_ratio is None else r.th.two_face_ratio,
+            "topk": r.th.topk,
             "body_enabled": int(r.th.body_enabled), "body_link": r.th.body_link,
             "n_targets": r.total.n, "correct": r.total.correct, "wrong": r.total.wrong,
             "flagged": r.total.flagged, "abstain": r.total.abstain,
@@ -345,7 +349,7 @@ def summarize(rows: list[dict], point: dict | None) -> str:
         lines.append("no grid row passes the gate")
     else:
         lines.append("operating point: " + ", ".join(f"{k}={point[k]}" for k in (
-            "combo", "face_sim", "face_margin", "face_q_min", "body_enabled",
+            "combo", "face_sim", "face_margin", "face_q_min", "min_face_norm", "two_face_ratio", "body_enabled",
             "promote_labeled", "promote_precision", "promote_lo95_days", "promote_cp_lo", "promote_coverage",
             "noface_coverage", "loo_n", "loo_fa_cp_hi", "unlabeled_promotions")))
         lines.append("(chosen on the same labels it is scored on: optimistic; confirm on the adjudication set)")
