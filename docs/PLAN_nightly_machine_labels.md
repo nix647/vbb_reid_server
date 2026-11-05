@@ -1,0 +1,351 @@
+# Plan: server-side machine re-verification of person sightings (v1)
+
+Status: APPROVED by the owner 2026-11-03; Phase A in progress (worker `nix647/vbb_reid_server`, 0.1.5, 2026-11-05). Gate G_A revised 2026-11-05 (§3c E1). No backend repo changed.
+Supersedes section 5 and the open-items table of `handoff_nightly_reverify.md`; everything else in the handoff still holds unless restated here.
+
+Code facts below were re-read in this session at these heads:
+`alonsolee/vbb@ea5184b` · `alonsolee/vbb_nursery@58f3edc` (tag v0.0.108 = HEAD~1) · `alonsolee/vbb_device_events@5e5ad0e` (0.0.11) · `nix647/vbb_device_backend@d31afec` · `nix647/vbb_contracts@2bd6cdd` · `nix647/vbb_ReID@1f86aba` (0.16.0).
+**Not readable in this session:** the board repo `nix647/vbb` (same directory name as `alonsolee/vbb`). Every board-side fact marked **[board, unverified]** comes from the handoff or the contracts and must be re-read in a session that attaches `nix647/vbb`.
+
+---
+
+## 0. One-paragraph summary
+
+A worker on a GPU host re-identifies each test facility's person sightings a day at a time with a stronger face model and a body model, using **only human-labeled crops as references**, and emits a *machine label* only when it clears a precision target the owner sets. Phase A runs **entirely offline** (SQL dump + CDN crops + crops copied from the test boards over the LAN), so no backend repo changes until the model has passed the gate. Phase B adds two nursery tables, a worker API on the device backend, one shared identity resolver (human → machine → board) behind a kill switch, and shows machine labels in the review feed with provenance and no score. Phase C teaches boards from machine labels through the existing `reconcile_identity` path with a new `machine` vector source that can never evict or outrank human evidence. Fine-tuning on own data, facility 1 (cloud host) and cross-board sharing of machine-taught faces are later phases.
+
+---
+
+## 1. Goals and non-goals of v1
+
+Goals
+- G1. Recover identities the board left `uncertain`/`stranger` ("promotions": 1,591 in 30 days across the test facilities) at a measured precision, without a human.
+- G2. Keep human labels as the only ground truth, byte-for-byte untouched by anything the machine does.
+- G3. Be reversible in one update (kill switch, run revert), and auditable (every label has run, model, thresholds, evidence).
+- G4. Produce the corpus categories prediction / machine / ground_truth so fine-tuning can start later without new plumbing.
+
+Non-goals (v1)
+- Relabels (board `known A` → machine `known B`): recorded in shadow for measurement, never displayed or taught.
+- Demotions: the machine never writes `stranger` or `uncertain`.
+- Facility 1: excluded (owner 2026-11-02; 15 human labels in 30 days, all demotions, so no references exist). It needs a cloud GPU host later anyway.
+- Any embedding-derived hint, score or ordering shown to a reviewer (07-24 ruling as clarified in decision 3).
+- Self-training: machine labels never serve as references in v1.
+- Fine-tuning: later phase; v1 ships an off-the-shelf model that passes the gate.
+- Minting people: the machine assigns only `person_id`s that already exist (closed roster, §5.3).
+
+---
+
+## 2. Decision register
+
+Owner decisions 1–10 of the handoff stand. Added this session (2026-11-02):
+
+| # | Decision | Consequence |
+|---|---|---|
+| 11 | Facility 1 excluded from v1 | Eval and shadow on facilities ≠ 1 ("everything except facility 1 is a test facility") |
+| 12 | Testing on `gpu-ubun` (LAN of the test boards), manual pulls, no nightly job until the gate passes | Phase A has no backend dependency; the worker is a CLI first, a scheduled job later |
+| 13 | Second crop per sighting is wanted (mixed-track detection) | Test phase: `rsync` from the boards' sighting store; production: board upload + contract + ingest (`nix647/vbb` change) |
+| 14 | No long retention on GPU hosts | No crops kept after a run; embedding cache 14 days; reference window is a tuning parameter |
+| 15 | Training / fine-tuning in later phases | Phase D |
+| 16 | Board-side code (`nix647/vbb`) is specified through contract entries; implemented by the board developer or by a later session that attaches `nix647/vbb` | Phases A, B touch no board code; Phase C and the 2nd-crop upload do |
+| 17 | alonsolee-team changes are implemented by us on branch `claude/wonderful-hawking-vpm3va` for their review | Still no push before this plan is approved |
+| 18 | Accepted defaults: promotions-only display; `flag` rows for metrics only; closed roster; human-labeled crops as the only references; worker fetches crops from the CDN; SQL dump for the eval; a new repo for the worker | — |
+| 19 | (2026-11-05) Phase A bar: 0.98, the one-sided 97.5 % binomial lower bound on new-name precision from a uniform, blind sample of the machine's own new names | Met for the face path on facility 3 (§3c E7) |
+| 20 | (2026-11-05) Label budget: about 800 owner labels for Phase A in total; about 600 used (300 board-stratified, 103 low-norm, 200 new names). Any stage that needs new labels states how many and why before it starts | The body stage and any model change must reuse existing answers as screens |
+| 21 | (2026-11-05) Worker tokens live in the nursery database, beside the two machine-label tables (Phase B Q1) | Contract amendment C1 |
+| 22 | (2026-11-05) Machine labels go live only after the staff app shows the machine badge, facility 3 included (Phase B Q5) | Activation waits on the app update |
+| 23 | (2026-11-05) Activation is manual through the trial; after Gate G_B, nightly runs go live automatically unless a safety check trips (Phase B Q6) | Guards: promotions within a set share of the day, no names outside the roster, every named person has enough references |
+| 24 | (2026-11-05) gpu-ubun reaches the device backend over the internet (Phase B Q8, owner) | No network work needed for B.4 |
+| 25 | (2026-11-05) Live monitoring: about 20 blind owner labels a week for the first one or two months of rollout, then label-free metrics (Phase B Q9) | Counts against the label budget; any wrong label pauses activation |
+| OPEN | Sharing threshold (T19) | Owner sets the number before sharing is considered; proposal in §8 |
+
+---
+
+## 3. Verified facts the design rests on (file:line, this session)
+
+Identity writers and readers (nursery package `vbb_nursery/src/Module/NurseryMonitor/Helpers/`)
+- Human overlay is a seven-write transaction: mint, tentative binding, role, overlay, audit, outbox, face-vector alignment (`PersonReviewHelper.php:445-578`). Overlay columns: `corrected_state/_person_id/_name/_by/_at/_ts`, `reconcile_status=pending` (`:513-523`).
+- Receipt handler `applyReconcileResults` **fills `corrected_person_id` on `applied`** when empty (`:708-710`) and overwrites `provisional_person_id` on a split (`:715-720`). → flaw F1, §4.
+- Readers that resolve identity inline today: `AppearanceGrouper::effectiveIdentity` (`AppearanceGrouper.php:178-197`), `PersonReviewHelper::_identityClassKey` (`:841-860`), `FaceHelper::_creditedPersonId`, `PersonMergeHelper::_personSightingStats`, `AttributionHelper::_trackIdentity` (`:281-306`) and `:455-483`, `EventEscalator.php:726-729` (reads `corrected_person_id` for `face_gallery.photo_url`). Merge folding is applied inconsistently (in-memory fold in the feed, inline `aliasOf` in attribution, none in `_faceSightingOwners`).
+- `PersonFaceVectorHelper::_faceSightingOwners` (`:1113-1157`) deliberately reads only human corrections. Stays human-only (decision 10).
+- Outbox snapshots an *intent* bag, not a payload (`person_reconcile_outbox.sql:19-22`); identity-rename rows already use a `kind` discriminator (`ReconcileOutboxHelper.php:126-178`). The wire `assign` is rebuilt from named keys (`:331-345`), `corrected_ts` converted ms→s in one place (`:343`). Rows expire after 7 days (`:425-459`). `_stampSightingReconcileStatus` only touches retryable statuses (`:569-580`).
+- The package reads no feature flags itself: switches are passed in by the app (`PersonFaceVectorHelper.php:76-83`) or live as scoped device-config keys (`RuleBook.php:710`).
+- DDL conventions: `*_ts BIGINT` ms with a paired DATETIME; `state TINYINT DEFAULT 1`; small device fields go to `extras JSON` (`multicam_camera_name.sql:148`); `-- 施加于生产：<date>` headers; `php artisan nursery:check-schema` compares against `create_vbb_nursery.sql`. MySQL 5.7, READ-COMMITTED, non-strict. `v_facilities.time_zone` (default `Asia/Shanghai`) and `v_facilities.org_id` exist (`create_vbb_nursery.sql:34-47`).
+
+App backend (`alonsolee/vbb`)
+- `ReconcilePublisher` forwards `assign` **whole** (`app/Services/ReconcilePublisher.php:60-67`); payload comes from `Nursery::resolveReconcilePayload`. Minute sweeper: `nursery:reconcile-replay` (`app/Console/Kernel.php:42-43`), gated by `monitors.person_review.reconcile_mqtt_enabled` (`config/monitors.php:63`).
+- `AppDeviceEventsHandler` passes `person_sighting` through whole (`:100`) but maps `reconcile_result` by named keys (`:118-128`) → a top-level echo would be dropped; per-item fields in `results[]` survive. `vbb_device_events` strips nothing (`BaseDeviceEvent.php:34`, `:199-215`); schema `reconcile_result.schema.json` is `additionalProperties: true`.
+- Kill-switch convention: `config/monitors.php` + `MONITORS_*` env.
+- Tests: in-memory SQLite harness `tests/Nursery/NurseryTestCase.php:50-55`; schema hand-copied in `tests/Nursery/Support/NurserySchema.php:28-83` with a fidelity test on column names. Run: `vendor/bin/phpunit --testsuite Nursery`.
+- Tracked `vendor/vbb/nursery` is byte-identical to `vbb_nursery@58f3edc` but `composer.lock` pins v0.0.95 (`composer.json:31`): a `composer install` would revert library code (known, STATUS.md:111).
+
+Device backend (`nix647/vbb_device_backend`)
+- Routes are per-feature files auto-scanned (`app/Providers/RouteServiceProvider.php:86`); faces endpoints at `app/Features/Device/feature_routes.php:51-52`.
+- Only server-to-server auth today: IP allowlist `InternalNetworkOnly` (`app/Http/Middleware/InternalNetworkOnly.php:20-26`) and the **fleet-shared** device signature `md5(sorted params + APP_SECRET_KEY)` (`SignatureInterceptor.php:21-38`). Neither fits a GPU worker that is not on the backend's LAN.
+- Swoole, `WORKER_NUM=4`, nginx 60 s read/send timeout (`docs/SWOOLE_DEPLOYMENT.md:14-15, 91-92`); no scheduler, no queue worker on this host (`app/Console/Kernel.php:24-27`; `DEPLOYMENT_PLAN.md:258-266`).
+- Logic classes call the nursery facade (`DevicePersonFacesSyncLogic.php:40-52`); `config/database.php` is deploy-only (git-ignored).
+
+ReID (`nix647/vbb_ReID`)
+- `VectorRecord.source` is a free string; human sources `_HUMAN_SOURCES = {enroll, reconcile, merge}` (`gallery.py:132`); `share_manifest` whitelists human + `shared` + legacy anchors (`:2404-2408`) → a `machine` source is excluded with no change. `merge_registered` relabels only human sources (`:2145-2150`).
+- `_admit_record` evicts FIFO, blind to source except `shared` (`:1751-1763`) → flaw F2. `apply_shared` keeps shared records outside the queue with its own count and cap (`:2472-2495`): the pattern to copy.
+- `enroll_from_features` hardcodes `source="reconcile"`, founds a missing profile as anchor, sets `met_here=True`, passes `min_match_sim=None` (`:1944-1975`). The live path's identity gate is `min_match_sim=cfg.gallery_min_sim` (`:1693`, default 0.5).
+- `reconciliation.py` carries no "who corrected" (`IdentityLabel :43-49`, `ReconcileRequest :101-109`); single enroll call site `:204`.
+- Models: SCRFD `det_2.5g` 640², AdaFace `adaface_ir50_b2` 112² BGR 512-d, body `vit_s16_ics_b2` 256×128 (dim not pinned in repo), `qf` from `face/scoring.py:79-164`, calibration notes `calibrate_thresholds.py:15-18` (face same-person strict ≈ 0.545).
+- `TrackResolved` carries `face_features`, `face_qualities`, `body_embedding`, `crop_jpegs` (`events.py:138-193`); board keeps K=2 crops 7 days in `<data_root>/person_sightings/crops/<YYYY-MM-DD>/<sighting_id>/<idx>.jpg` plus `embeddings/<sighting_id>.npz` (contracts `reid_reconciliation_api.md §4`) **[board, unverified]**.
+- `eval_replay.py` is pure Python scoring (reusable); the ONNX port on `gpu-ubun` is uncommitted (`docs/box_experiments.md:21-33`); an 89-clip labeled video corpus and `eval_run.py` exist on the box, outside git.
+
+Contracts
+- `reconcile_identity.assign` has **no JSON schema** and no explicit unknown-key statement; the envelope rule (`backend_to_device.md:19`) and `schemas/README.md:28-30` give additive-by-default. `reconcile_result` per-item fields are `{sighting_id, outcome, person_id, provisional_person_id?}` (`device_to_backend.md:1202-1206`).
+- Review feed shows prediction vs effective identity and a boolean `corrected` ("any member carries a human correction", `person_review.schema.json:296-298`); no label-provenance field exists yet (`backend_to_app.md:323-378`).
+- Corpus export: still none (`reid_reconciliation_api.md:153`, STATUS.md:81).
+- CI: `validate_schemas.py` then `gen_status.py --check` (`.github/workflows/contracts-ci.yml:21-25`).
+
+### 3b. What the production export shows (`export_machine_eval.php`, run 2026-11-03 10:33, window from 2026-09-04)
+
+| | Facility 2 | Facility 3 |
+|---|---|---|
+| Brand (`org_id`) | 2 | 2 |
+| Data span | 2026-10-09 → 10-21, 8 days with data | 2026-10-15 → 11-03, 20 days |
+| Sightings | 9,673 (board 43: 9,552; board 69: 121) | 17,390 (board 45: 17,389) |
+| Board prediction | known 6,868 · uncertain 2,258 · stranger 547 | known 10,099 · uncertain 5,853 · stranger 1,438 |
+| Face crop share | 74.9 % | 58.2 % |
+| Human-labeled sightings | 495 (476 stranger→known, 19 relabels) | 1,156 (1,120 stranger→known, 36 relabels) |
+| People with human labels | 4 (433 / 35 / 21 / 6 labels) | 4 (992 / 81 / 60 / 23) |
+| Label lag (capture → label) | median 4.7 h, p90 45 h | median 50 h, p90 70 h |
+| Unlabeled `uncertain` (with face crop) | 2,258 (730) | 5,853 (1,720) |
+
+Consequences for the plan (folded into §6 and §7):
+- D1. **Labels come in a few bulk sessions, not a steady stream.** 1,704 correction rows in 49 batches on 7 days; three batches (392, 681, 300 rows) are whole board stranger classes (`provisional_person_id` 80b13f6fb087, 47cc79b7aff9, f99d4a2effde) being named. About 1,370 of 1,596 promotions are three naming decisions. Agreement on these measures whether the machine names a board cluster correctly, and the effective sample is ~49 decisions, not 1,651.
+- D2. **No `uncertain` sighting has ever been labeled** (0 of 8,111), yet it is the largest pool. There is no ground truth for the machine's main target; it must be created (adjudication set, §6).
+- D3. **No human-labeled strangers survive in the overlay** (49 `stranger` assignments were later re-labeled `known`), so false accepts cannot be measured from existing labels.
+- D4. **Organic labeling has nearly stopped** (since 10-21: 18 labels on 10-26, 5 on 11-02). A gate of "agreement with labels that arrive later" would never fill; the gate must rest on deliberate adjudication.
+- D5. **Second crops exist only for the last 7 days of facility 3** (boards keep 7 days); facility 2 has no data after 10-21. Weekly rsync must start now to accumulate.
+- D6. Board `crop_count` was 5 before the K=2 change (4,139 rows) and 1 for 4,352 rows; the worker must accept 1–5 crops per sighting.
+- D7. All 8 labeled people have ids unique to one facility; the 4 in facility 3 are all `person_type=visitor` with no role. Body bbox height median 206 px (fac 2) / 308 px (fac 3); face size not in the data yet.
+- D8 (owner 2026-11-03). **The 8 ids are the same 4 people** registered once per facility. The eval maps them to 4 humans (mapping table from the owner), which gives a cross-camera test: references from facility 2 (board 43) identify people on facility 3 (board 45) and vice versa. Production v1 keeps references per facility (ids are per campus); pooling across a brand's facilities is a Phase D question tied to merges.
+- D9 (owner 2026-11-03). **`uncertain` is not shown in the review feed** (a setting), which explains D2. **Facility 2 is no longer in use**: its Oct 9–21 data is used for references and the offline eval only; shadow runs are facility 3 only.
+- D10. Four well-known people is an easy setting. It cannot show behaviour with a 20+ roster or with real strangers; F3 stands and becomes a hard precondition before any non-test facility is enabled.
+
+### 3c. What the Phase A runs showed (gpu-ubun, buffalo_l face, 2026-11-04/05)
+
+- E1. **The labeled-set gate is a screen, not the gate.** Facility 3 passes at 0.999 on 981 labeled promotions, yet a targeted set of 103 sightings the machine named from low-norm faces had 19 wrong of 94 scored, all of them NEW names (agreements with the board: 48 of 48 right). Labeled targets come from bulk naming of clean board groups; the unlabeled pool holds the junk.
+- E2. Below raw feature norm 14, new names were right 9 of 27; 14-16: 18 of 19. A probe norm floor of 14 removed 18 of the 19 errors at no cost on the labeled set or the first 300 (chosen on these answers: needs a fresh check).
+- E3. 18 of the 19 wrong names were H1, the person with 300 references (others <= 55). Hypothesis under test: for a junk face the best of N chance similarities grows with N, and top-3 scoring keeps that bias; a per-person reference cap (`--max-refs`) tests it.
+- E4. The two-faces rule (second face >= 0.25 of the chosen face's height, det >= 0.6) removes the only temporal error on the labeled set (a two-person crop) at a cost of about 5 labeled names.
+- E5. Quality policy A kept (B never differed measurably). Facility 2 (retired): NOT ENOUGH EVIDENCE YET at every row — 368 labeled promotions and 736 leave-one-out trials would be needed at zero errors.
+- E6. Bugs found by the owner's checks and fixed (0.1.2-0.1.4): stored qf, shadow seeing future labels, gate trusting tiny samples, cache ids without preprocessing, a face-score cache that ignored the guards.
+- E7. **Phase A face path, facility 3: primary gate passed at the owner's 0.98 bar (2026-11-05).** A uniform draw of 200 of the machine's 1,000 unreviewed new names, labeled blind by the owner: 199 right, 0 wrong, 1 can't tell; one-sided 97.5 % lower bound 0.9816 (0.99 would need about 368 at zero errors). Named H1 63/63, H2 63/63, H3 37/37, H4 36/36. Screens at the same point: labeled-set PASS (966 labeled promotions, 0 wrong, lower bound 0.996), leave-one-person-out false-accept upper bound 0.0032, the board-stratified 300 with 0 wrong. Reference cap: in the low-norm band, errors fell from 19 to 6 (cap 50) and 2 (cap 25) without the floor, supporting E3; with the floor on, cap 50 removed one more error (a stranger named H1). Limits: one facility, 10-15 to 11-03, four well-known people, few real strangers (4 in the low-norm set, none among the 200). The one leave-one-day-out error at 0.410 (`36aed033c5b4`, labeled H1, named H3) was checked by the owner 2026-11-05: the crop is H3 with only H1's arm in frame, so the label was wrong and the machine right; leave-one-day-out has no real error from it.
+- E8. **Operating point v1 (facility 3):** InsightFace buffalo_l (SCRFD det_10g + ArcFace w600k_r50, RGB, flip), quality policy A, references = human labels existing at each night's run (window 60 days, qf >= 0.40, at most 50 labeled sightings per person), face_sim 0.40, margin 0.05, face_q_min 0, probe feature-norm floor 14, two-faces rule 0.25 (second-face det >= 0.6), body path off. v1 never names a face-less sighting; uncertain/no-face is the largest unlabeled stratum (about 4,100 of 10,800 in facility 3).
+- E10. **Adversarial review of Phase B work (2026-11-05):** worker, photo change and contract reviewed independently. Design changes: per-facility switch in the nursery DB with a feed stamp (not `.env`); label column `label_state`; worker never activates; idempotent lifecycle calls; whole-card human actions must not convert machine labels (owner decision Q12 in `PLAN_phase_B.md`). Details: `PLAN_phase_B.md` "Adversarial review".
+- E9. **Production references are roster-only (2026-11-05, found writing the Phase B client).** Phase A unified facility 2 and 3 ids of the same four people with the owner's alias file. Production has no alias file, so `references/pull` sends only labels whose person folds to the facility's own roster. Otherwise the same human under two ids would be the runner-up to themselves, and the margin rule would make the machine abstain. Effect on the E8 result: to be measured offline (SETUP step 6g, existing answers, no new labels).
+
+---
+
+## 4. Flaws found in the handoff design, and their fixes
+
+**F1 — Machine receipts would contaminate human ground truth.** If machine corrections ride the outbox and a board echoes `applied`, `applyReconcileResults` writes the machine `person_id` into `corrected_person_id` (`PersonReviewHelper.php:708-710`); every reader, the corpus join and `_faceSightingOwners` would then treat it as human.
+Fix (Phase C): outbox rows carry `assign.source="machine"` + `assign.machine_run_id`; the receipt handler resolves the source **from the outbox row for that sighting** (not from the board's echo); machine receipts update only `v_person_sighting_machine_labels.reconcile_status`; `markReconcileSent` / `_stampSightingReconcileStatus` are not applied to `v_person_sightings` for machine rows. Invariant, tested with a mutation: **nothing machine ever writes `corrected_*` or `v_person_sightings.reconcile_status`.**
+
+**F2 — A machine exemplar would evict human exemplars on the board.** `_admit_record` is FIFO and source-blind except `shared`.
+Fix (Phase C, ReID): `source="machine"` records sit outside the human queue, counted against their own cap (`machine_max_per_person`, default 10, config), never anchor, never found a profile, never set `met_here`, admitted only through the identity gate (`min_match_sim=cfg.machine_min_sim`, measured). Copy the `apply_shared` mechanics; add `source=` and `found=` parameters to `enroll_from_features` rather than a new method, so `_unenroll_elsewhere` and journaling stay on one path.
+
+**F3 — The 4-identity test roster measures the wrong thing if read naively.** Facilities 2–3 have about four registered people and a few visitors. Confusion *between* known people is barely exercised; the dominant production risk is naming a stranger as a known person. The eval therefore gates on **open-set** metrics (leave-one-person-out and human-labeled strangers), and the plan says explicitly that results must be re-validated on the first facility with a roster of 20+.
+
+---
+
+## 5. Design
+
+### 5.1 Identity stack and the shared resolver (nursery package)
+`IdentityResolver::effective(array $sightingRow, ?array $machineLabel, ResolverContext $ctx): ['state','person_id','name','source' => 'human'|'machine'|'board']`
+1. Human overlay: `corrected_at` set → `corrected_state`/`corrected_person_id` (today's rule, unchanged; a reset-to-pending row resolves `uncertain`).
+2. Machine: `$ctx->machineEnabledFor($facility_id)` **and** an **active** machine row with `state='known'` and `relation='promote'` → `known`/`machine.person_id`, source `machine`. (`relation='relabel'` is never used by the resolver in v1.)
+3. Board prediction (unchanged).
+Merge folding: the resolver returns the raw id; folding stays where each reader already does it, **except** that machine `person_id`s are folded the same way as board ones (machine ids come from the same roster).
+Readers switched: `AppearanceGrouper::effectiveIdentity`, `PersonReviewHelper::_identityClassKey`, `FaceHelper::_creditedPersonId`, `PersonMergeHelper::_personSightingStats`, `AttributionHelper::_trackIdentity` and `:455-483`, `EventEscalator.php:726-729`. **Not** switched: `PersonFaceVectorHelper::_faceSightingOwners` (decision 10).
+Machine rows are prefetched once per call (`sighting_id IN (...) AND active=1`) and passed in; no per-row queries.
+Kill switch: the app resolves `MONITORS_MACHINE_LABELS_FACILITIES` (comma list; empty = off everywhere) in `config/monitors.php` and hands it to the package once per request (`Nursery::setMachineLabelFacilities([...])`), following "the caller passes the switch". Default off. Turning it off hides every machine label instantly; nothing is deleted.
+
+### 5.2 Data model (nursery, additive; `database/migrations/person_machine_labels.sql`)
+`v_person_machine_runs`: `id`, `run_id CHAR(32) UNIQUE`, `org_id`, `facility_id`, `day DATE` (facility-local, by `v_facilities.time_zone`), `worker_id`, `model_id VARCHAR(128)` (face+body weights hashes + worker version), `thresholds JSON`, `status ENUM('running','done','failed','activated','reverted')`, `counts JSON`, `started_at`, `finished_at`, `activated_at`, `reverted_at`, `state`, `created_at`, `updated_at`. Index `(facility_id, day, status)`.
+`v_person_sighting_machine_labels`: `id`, `sighting_id VARCHAR(64)`, `run_id CHAR(32)`, `facility_id`, `room_id`, `did`, `label_state ENUM('known','flag')` (was `state`, which clashed with the soft-delete column; E10), `relation ENUM('promote','agree','relabel','mixed','conflict')`, `person_id VARCHAR(100) NULL`, `confidence DECIMAL(6,5)`, `margin DECIMAL(6,5)`, `face_sim DECIMAL(6,5) NULL`, `body_sim DECIMAL(6,5) NULL`, `evidence JSON` (crops used, reference counts, cluster id, conflicts), `active TINYINT(1) DEFAULT 0`, `reconcile_status ENUM('none','pending','sent','applied','noop','not_found','error','expired','retracted') DEFAULT 'none'`, `reconcile_message`, `reconciled_at`, `state`, `created_at`, `updated_at`. `UNIQUE (sighting_id, run_id)`; index `(facility_id, run_id, active)`, `(sighting_id, active)`.
+Rules: append-only per run; `active` flips for a whole run in one UPDATE (activate / revert); at most one active run per `(facility_id, day)`; a re-run for the same day supersedes (deactivates) the previous run. No embeddings in the DB. Corpus categories: prediction = `v_person_sightings` raw columns; machine = these rows (+ `model_id`); ground_truth = human overlay. `v_person_sighting_corrections` stays human-only.
+
+### 5.3 The worker (new repo, Python, GPU host)
+Package `vbb-reid-server` (name TBC), separate from `vbb-reid` (board, `--no-deps`, explicit package list). Depends on `onnxruntime-gpu` or `torch`, `numpy`, `opencv-python-headless`, `scipy`; copies `vector_id_of` and the `eval_replay` scoring rather than importing the board package.
+Inputs per `(facility, day)`: sightings (prediction, crop URL(s), `capture_ts`, `room_id`, `did`, `crop_is_face`), human labels (overlay + corrections), roster (`face_gallery` + `person_roster` + `person_identity_role` + `merged_into`), rooms/devices (for co-occurrence rules), facility time zone. Phase A: from the SQL export CSVs + CDN + LAN crop copies; Phase B: from the worker API (§5.4).
+Pipeline per sighting (1–2 crops):
+1. Face: SCRFD-10G on the crop → largest face with det ≥ `det_min` and height ≥ `face_min_px` → 5-point alignment 112×112 → face model → 512-d unit vector; quality `qf` as on the board (`face/scoring.py`), so face-size and blur buckets are comparable.
+2. Body: whole crop → body encoder → unit vector.
+3. Mixed-track check (2 crops): if the two crops' face identities disagree, or body similarity between them is below `same_track_min`, the sighting is `flag/mixed`; it is never labeled and never used as a reference.
+Reference sets (closed roster = every non-tentative, non-merged registered id of the facility. **Visitors are included**: every registered person in facility 3 is `person_type=visitor` (export 2026-11-03), so excluding them would empty the roster. A person with no human-labeled crops has no references and can never be named):
+- Face references of P: embeddings of crops from human-labeled `known` sightings of P (facility and brand), within window `W_ref` (eval picks 30/60/90 days), de-duplicated by farthest-point sampling, per-crop `qf` kept.
+- Body references of P: **same day only** (clothes), seeded by human-labeled sightings of P that day and by sightings the face path already confirmed above a stricter floor.
+Decision (all thresholds measured in the eval, stored per run in `thresholds`):
+- Face decision: `face_sim ≥ τ_f` and `margin ≥ δ_f` (best minus second-best person) and `qf ≥ q_min` → candidate P.
+- Body decision (face-less sightings): same-day linking by body embedding within `(facility, day)`, time-constrained; a cluster adopts P only if it is *pure* (no conflicting face identities, no two members overlapping in time in different rooms, no two members in one frame) and `body_sim ≥ τ_b`, `margin ≥ δ_b`.
+- Relation to the board: board `uncertain`/`stranger` → `promote`; board `known P` → `agree`; board `known Q≠P` → `relabel` (flag only); below floors → no row (abstain); mixed/co-occurrence conflicts → `flag`.
+- Emitted rows: `known/promote`, `known/agree` (metrics), `flag/*`. `relabel` rows are `flag` in v1.
+Caches: embeddings keyed by `(sighting_id, crop_index, model_id)`, 14 days, rebuildable; no crops retained after a run.
+Run lifecycle: `run_id` minted by the worker; register → pull → compute → push labels (idempotent) → finish with counts; activation and revert are separate, deliberate calls (CLI in Phase A, admin API in Phase B). One worker holds a lease per `(facility, day)` so a second host cannot double-run; hosts scale by assigning brands.
+
+### 5.4 Worker API (Phase B, `nix647/vbb_device_backend`, new feature `Worker`)
+All over HTTPS from outside the backend LAN, so: new middleware `WorkerTokenAuth` (`Authorization: Bearer <token>`; `v_machine_workers`: `id`, `org_id` scope, `token_hash`, `label`, `state`, `last_seen_at`), rate-limited, no device signature, `internal` allowlist **not** used (GPU hosts are not on that LAN). Page sizes ≤ 500 rows and every call well under the 60 s nginx limit; no long polls (4 Swoole workers).
+- `POST /worker/runs/register` `{facility_id, day, model_id, thresholds, worker_id}` → `{run_id, lease_until}`; refuses if another run is `running` for the pair unless its lease expired.
+- `POST /worker/sightings/pull` `{facility_id, day, cursor?, limit≤500}` → sightings with prediction columns, overlay presence and label (human labels are inputs: references), `image_url`, `extras.image_urls`, `capture_ts`, `room_id`, `did`, `crop_is_face`, `crop_quality`; `next_cursor`.
+- `POST /worker/references/pull` `{facility_id, since_ts, cursor?}` → human-labeled `known` crops `{sighting_id, person_id, image_url, image_urls, capture_ts, corrected_ts}` + roster `{person_id, person_type, role, merged_into, tentative}` + rooms/devices + `time_zone`. No names.
+- `POST /worker/labels/push` `{run_id, rows[≤500]}` → upsert on `(sighting_id, run_id)`; validates `person_id ∈ roster`, `state`, `relation`.
+- `POST /worker/runs/finish` `{run_id, status: done|failed, counts}`.
+- `POST /worker/runs/activate` / `revert` `{run_id}` (admin token scope; also an artisan command on the app host as the emergency path).
+All writes go through one nursery helper `MachineLabelHelper` (facade methods), as the faces endpoints do. Every endpoint gets a `vbb_contracts` entry + schema + valid example; section `machine_labels.md` (new file) with Provenance and per-consumer action items.
+
+### 5.5 Display (Phase B, review feed)
+`backend_to_app.md` person review: additive `appearances[].source` and `sightings[].source` ∈ `human|machine|board`; the app shows a provenance mark for `machine` **with no score**; `corrected` keeps meaning "human". Decision 3 wording goes verbatim into the contract entry with the date. Feed, scope expansion, roster photo credit, merge statistics and alert attribution read through the resolver (decisions 8–9).
+
+### 5.6 Delivery to boards (Phase C)
+- Outbox: `_enqueueMachineReconcile` writes rows with `assign = {kind:'sighting', source:'machine', machine_run_id, state:'known', person_id, scope:'selected', provisional_person_id:null, role_carried:null}`, `correction_ts` = run activation time (ms). `resolveReconcilePayload` passes `source` and `machine_run_id` to the wire `assign`. Only `known/promote`, face-confirmed, active rows are sent; **never** body-only propagated labels (they would teach body vectors of a face-less sighting), never a sighting with a human overlay, capped per `(person, did, night)` (`machine_teach_cap`, default 5), chunked ≤ 20 sighting_ids per command.
+- Receipts: routed by outbox row source (F1); machine rows' `reconcile_status` only.
+- Revert: `retract_identity` command `{sighting_ids[], source:'machine', machine_run_id}`; the board removes **exactly the vector ids it journaled for that machine correction** (`unenroll_vectors`), answers through `reconcile_result` with `outcome` and the sighting ids; server marks rows `retracted`. Built on the existing journal; no new ReID primitive.
+- ReID (`vbb_ReID`): `IdentityLabel.source: str = "human"`; threaded to `enroll_from_features(source=, found=False, min_match_sim=cfg.machine_min_sim, mark_met_here=False)`; `_admit_record` machine lane (F2); `face_match_provenance` unchanged in v1 (`matched_via` stays local/shared/mixed).
+- Board (`nix647/vbb`) **[unverified]**: parse `assign.source`; journal `source` per correction; precedence: human beats machine regardless of `corrected_ts`, machine vs machine newest-wins; per-tick drain limit for the reconcile queue; `retract_identity` handler; `machine_min_sim`, `machine_max_per_person` in `configs/app.yaml`.
+- Wire: `reconcile_identity.assign.source` (additive; absent = `human`), `retract_identity` (new command; old boards ignore unknown commands, `backend_to_device.md:19`), `reconcile_result.results[].source` echo (additive, optional; the server does not rely on it).
+
+### 5.7 Second crop (decision 13)
+- Test phase: `rsync -a --include` of `<data_root>/person_sightings/crops/<day>/<sighting_id>/1.jpg` from each test board to `gpu-ubun` (read-only; boards keep 7 days, so weekly pulls). Needs the boards' `data_root` and SSH access **[board, unverified]**.
+- Production: board uploads `{sighting_id}_1.jpg` beside the best crop; `person_sighting` gains additive `image_urls: [url0, url1]`; backend stores it in `v_person_sightings.extras.image_urls` (no new column, per DDL convention); `evidence_ready` back-fill unchanged for the best crop. Contract entry + `nix647/vbb` change (`evidence.py`, `EvidenceCapture` retry markers) + one line in `insertPersonSighting`.
+
+---
+
+## 6. Model candidates and the evaluation protocol (T5)
+
+Candidates (download for evaluation now; commercial terms requested in parallel, T18; a non-commercial model may be measured but not shipped):
+
+| Role | Candidates | Notes |
+|---|---|---|
+| Face detect + align | SCRFD-10G (InsightFace) | same family as the board's 2.5g |
+| Face embed | board model on the server (AdaFace IR-50 via the gpu-ubun ONNX port) = **baseline**; AdaFace IR-101 (WebFace12M); AdaFace ViT + KP-RPE (CVLFace); ArcFace r100 glint360k; AuraFace (Apache-2.0, expected weaker, the license fallback) | WebFace/MS1M-trained weights are research-only; licenses to be requested |
+| Body embed | SigLIP2 (so400m or b/16) as a frozen encoder; DINOv3 ViT-L; CLIP-ReID ViT-B/16 as the ReID-trained reference; SapiensID (face+body) as a research reference | SigLIP2 is the production-licensable first choice |
+
+Data: SQL export (§10 step 1), CDN crops, LAN second crops (last 7 days, accumulated weekly), board ONNX port for the baseline.
+Splits:
+- Temporal: references from days ≤ D, evaluate days > D, rolling weekly.
+- Open-set, leave-one-person-out: drop person P's references; every human-labeled sighting of P must stay unlabeled. Report false accepts per person.
+- Strangers: human-labeled `stranger` sightings and visitor ids must stay unlabeled.
+Metrics per facility, per candidate, per threshold pair `(τ, δ)`: precision and recall of promotions against human labels; false-accept rate on strangers and in leave-one-out; abstention; mixed-track flag rate; split by face / no-face and by face-height bucket (<20 px, 20–40, 40–80, >80) and by 1 crop vs 2 crops.
+Setups compared: (a) board model + same-day linking; (b) big model alone; (c) big model + linking; each with 1 and 2 crops. Output: `curve_<model>_<facility>.csv` per setup, plus `eval_report.md` with the chosen operating point and its confidence interval (bootstrap over days).
+Caveat F3 stated in the report. Required before a label is ever displayed: the owner's photo check of a random sample of 100 promotions at the chosen operating point.
+
+**Adjudication set (added after the export, D1–D4).** Existing labels are used for *references* and as a secondary check; the gate rests on a set a human adjudicates on purpose:
+- Sample, per facility and stratified by board state (`uncertain`, unnamed `stranger`, `known`) and by face / no-face: 300 sightings for facility 3, 150 for facility 2, drawn uniformly over days, sightings already human-labeled excluded. Weekly shadow samples: facility 3 only (D9).
+- Open-set without real strangers (D3, D10): leave-one-person-out on the 4 humans is the primary false-accept measure; any adjudicated `stranger` (visitors, contractors) is added as it appears.
+- Adjudicator (the owner) sees the crop(s) and a fixed photo strip of each roster person (human-labeled crops only, no scores), answers `person / stranger / can't tell`. No second rater: the four test people know each other, so agreement would be trivially 100 % (owner 2026-11-03). `can't tell` is excluded from precision and reported; its rate is itself a result (crops no human can name are crops the machine must abstain on).
+- The adjudication page is preferred over labeling in the review feed for the eval set: it samples uniformly (the feed invites bulk class naming, D1), it is blind to the machine's output, and it has no side effects (feed labels trigger `reconcile_identity` and teach the boards). Showing `uncertain` in the feed is still worth doing for normal operation.
+- Tool: a static HTML page generated by the worker (local file, crops from the CDN), answers saved as CSV. No backend change.
+- The same tool draws the 100-promotion photo check at the chosen operating point, *blind* to which rows the machine labeled.
+- Precision is reported per sighting **and** per board class / per day, with bootstrap intervals over days, because labels are clustered (D1).
+
+---
+
+## 7. Phases, steps, gates, owners
+
+Repo ownership: **ours** = `nix647/vbb_contracts`, `nix647/vbb_device_backend`, `nix647/vbb_ReID`, the new worker repo; **ours on branch for review** = `alonsolee/vbb_nursery`, `alonsolee/vbb` (decision 17); **board developer or a later session** = `nix647/vbb` (decision 16).
+
+### Phase 0 — Groundwork (no repo code except the worker repo)
+| Step | Who | Done when |
+|---|---|---|
+| 0.1 Owner approves this plan | owner | written OK |
+| 0.2 Run `export_machine_eval.php`, upload the zip | owner | `summary.json` shows ≥ 2 facilities with human labels |
+| 0.3 `nvidia-smi`, `df -h`, CUDA/driver versions from `gpu-ubun`; SSH reachability of each test board and its `data_root` | owner | pasted |
+| 0.4 Create the worker repo; name decided | owner | repo exists on the designated branch |
+| 0.5 License requests: AdaFace/KP-RPE authors (CVLFace), InsightFace, SapiensID authors; ask for interim evaluation permission in the same mail | owner | sent; answers logged in T18 |
+| 0.6 Contract entries PROPOSED for every surface in §5.4–5.7 (`machine_labels.md`, schemas, examples, action items); `validate_schemas.py` + `gen_status.py --check` green | us | commit on `vbb_contracts` branch |
+| 0.7 Owner sets the two numbers (G_A precision target, T19 sharing threshold) | owner | recorded in the decision register |
+
+### Phase A — Offline evaluation and shadow (no backend changes)
+| Step | Who | Verify |
+|---|---|---|
+| A.1 Worker repo skeleton: data loaders (CSV + CDN + LAN crops), embedding cache, candidate model adapters, decision engine, eval harness, CLI `run --facility --day --from csv` | us | `pytest` green; red-before-green for the decision rule, margin check, mixed-track flag, co-occurrence conflict, closed roster, promotion-only emission; mutation: remove the margin check → test red |
+| A.2 Throughput probe (T4) on `gpu-ubun`: crops/s per model, VRAM | owner runs, we script | measured table |
+| A.3 Offline eval (T5) as in §6 | owner runs, we script and read | curve files + `eval_report.md`; operating point chosen |
+| A.0 Start weekly read-only rsync of the test boards' sighting crops to `gpu-ubun` (D5) | owner, we script | crops for every day since start, both indices |
+| A.3b Adjudication set built and labeled (§6) | we generate, owner + one colleague label | answers CSV; human agreement on the overlap reported |
+| A.4 Weekly shadow runs for ≥ 4 weeks on new days, scored on a fresh weekly adjudication sample (100 sightings) plus any organic labels | owner runs | `shadow_report_<week>.md`: precision on adjudicated promotions, false accepts, coverage |
+| A.5 Owner photo check of 100 promotions, blind | owner | pass/fail noted |
+| **Gate G_A** (revised 2026-11-05, E1) | | **Primary:** precision of NEW names (promotions) on a uniform random sample of the machine's own new names at the operating point, adjudicated by the owner: binomial lower bound ≥ [owner number] (0.99 needs about 368 at zero errors; 0.98 about 183), with strangers among them counted as wrong. **Screens that must also pass:** the labeled-set gate (PASS, not "not enough evidence"), leave-one-person-out false-accept upper bound ≤ [owner number], the board-stratified 300 with zero wrong, and a weekly fresh sample in shadow. Agreements with the board are reported separately and do not count toward the primary bound. |
+
+### Phase B — Display (nursery + app + device backend + contracts)
+Detailed plan, owner questions and deviations: `PLAN_phase_B.md` (2026-11-05). The rows below are the summary.
+| Step | Who | Verify |
+|---|---|---|
+| B.1 Nursery: DDL (§5.2), models, `MachineLabelHelper` (register/pull/push/finish/activate/revert), `IdentityResolver`, readers switched, `Nursery::setMachineLabelFacilities` | us, branch | app tests: resolver precedence human>machine>board; machine hidden when switch off / run inactive / run reverted; machine id folded through merges; `_faceSightingOwners` unchanged; `NurserySchema` fixture + fidelity test extended; **mutation:** remove the `active` filter → test red |
+| B.2 App: `config/monitors.php` switch, provider boot call, feed `source` field, artisan `nursery:machine-run {activate|revert}` | us, branch | `PersonReviewFormatter` test shows `source`; `corrected` still human-only |
+| B.3 Device backend: `Worker` feature, `WorkerTokenAuth`, `v_machine_workers`, six endpoints, request validation, paging | us | feature tests: no token 401, wrong org 403, page cap, idempotent push, lifecycle transitions; **mutation:** drop the org-scope check → test red |
+| B.4 Worker: API client replacing CSV loaders; cron on the GPU host at 02:30 facility-local; alerting on `failed` | us | one dry run writes rows `active=0` for one facility; counts match the CSV run for the same day |
+| B.5 Shadow-in-DB one week (rows inactive), then activate for one facility with the switch on for that facility only | owner | corrections per day before/after; one deliberate `revert` hides every label within one feed refresh |
+| **Gate G_B** | | manual corrections per day fall on the enabled facility; no human report of a wrong machine label in two weeks; revert drill done |
+
+### Phase C — Teach the boards
+| Step | Who | Verify |
+|---|---|---|
+| C.1 ReID: `source` on `IdentityLabel`; `enroll_from_features(source=, found=, min_match_sim=, mark_met_here=)`; machine lane in `_admit_record`; config keys; version bump (minor) | us | `pytest` following `test_shared_gallery.py`: machine outside the human cap; never founds; gate applied; `met_here` untouched; manifest excludes; survives merge as `machine`; retract removes exactly journaled ids; **mutation:** remove the lane → human exemplar evicted → test red |
+| C.2 Nursery/app: machine outbox rows, `resolveReconcilePayload` pass-through, receipt routing by outbox source (F1), `retract_identity` enqueue on revert, caps and chunking | us, branch | tests: a machine `applied` receipt leaves `corrected_*` and `reconcile_status` untouched (**mutation:** route by echo instead of outbox → red); only face-confirmed promote rows enqueued; cap respected; revert enqueues retract for exactly the sent ids |
+| C.3 Board (`nix647/vbb`): `assign.source` parse + journal, authority precedence, drain limit, `retract_identity` handler, config | board dev / later session | board tests: human-over-machine with an older `corrected_ts` (**mutation:** remove the authority check → red); drain limit measured; retract removes journaled ids only |
+| C.4 Cost probe on dev rk3576 (T16): ms per sighting apply + journal under a night's batch | owner | measured |
+| C.5 2nd-crop upload in production (§5.7) | board dev / later session + us (ingest) | `extras.image_urls` populated; worker uses both |
+| **Gate G_C** | | a week of logs with no eviction of human exemplars; next-day board promotions-needed count falls on taught boards; retract drill done |
+
+### Phase D — Later
+Fine-tuning on the human-labeled corpus (adapters first; train on earlier weeks, test on later weeks and on unseen people); facility 1 on a cloud GPU host with the same worker; decision 10 (sharing machine-taught faces) once T19's threshold is met; `matched_via`/provenance for machine on the board; MLLM re-ranking only if the eval shows a need.
+
+---
+
+## 8. Numbers the owner sets (placeholders)
+
+| Item | Proposal | Owner |
+|---|---|---|
+| G_A display precision on promotions | ≥ 99.0 % over ≥ 500 adjudicated cases, 4 consecutive weeks, per facility | ___ |
+| False-accept ceiling (strangers, leave-one-out) | ≤ 0.5 % of stranger sightings labeled | ___ |
+| T19 sharing threshold (decision 10) | G_A held for 4 further weeks in Phase B **and** zero human reverts of machine-taught faces | ___ |
+| `machine_teach_cap` per person per board per night | 5 | ___ |
+| `machine_max_per_person` (board exemplars) | 10 | ___ |
+
+---
+
+## 9. Risks
+
+| Risk | Mitigation |
+|---|---|
+| Open face weights are research-only (WebFace, MS1M); fine-tuning does not clear the license | Request commercial terms now (T18); AuraFace/SigLIP2 as licensable fallbacks; the gate picks the cheapest licensable model that passes |
+| 4-identity roster overstates closed-set accuracy (F3) | Open-set gates; re-validate on the first 20+ roster facility before enabling it |
+| Crop too small for any model | Eval reports face-height buckets; 2nd crop; abstain |
+| Human labels are sparse on some days → thin references | Reference window `W_ref` tuned; a person with < `ref_min` references is never assigned |
+| Board offline for days → machine outbox rows expire (7 days) | Acceptable; the server state stays; next run re-evaluates |
+| `composer install` reverting the vendored nursery (STATUS.md:111) | Pre-existing; our nursery changes ship by tag bump + vendor re-copy, as today |
+| Swoole worker starvation by big pulls | Page ≤ 500, no long polls, worker backoff |
+| Same-day body linking propagates one wrong face decision to a whole cluster | Purity rules; stricter floor for seeding; body-only labels never taught to boards |
+
+---
+
+## 10. Open items (continues the handoff numbering)
+
+| # | Item | Owner | Status |
+|---|---|---|---|
+| T4 | Throughput probe on `gpu-ubun` | script us / run owner | pending |
+| T5 | Offline eval per §6 | script us / run owner | pending |
+| T6 | Contract entries + schemas (§5.4–5.7) | us | done 2026-11-03: `machine_labels.md` PROPOSED, `nix647/vbb_contracts@78a3c69` on branch `claude/wonderful-hawking-vpm3va` (not merged to main) |
+| T7 | Nursery DDL, helper, resolver, switch (Phase B) | us on branch, alonsolee review | planned 2026-11-05 (`PLAN_phase_B.md` B.1); waiting on owner answers Q1-Q11 |
+| T8 | App switch, feed `source`, artisan commands; nursery re-vendor | us on branch | pending |
+| T9 | Worker package | us | Phase A done; Phase B client `run` 0.2.0 (`vbb_reid_server@f11d9a7`), untested against a real backend |
+| T10 | Shadow runs + reports | owner runs | pending |
+| T11 | Env on `gpu-ubun`: Python ≥ 3.10, `onnxruntime-gpu` or `torch`, `opencv-python-headless`, `scipy`, `pytest` | owner | pending |
+| T12 | Approve this plan | owner | done 2026-11-03 ("go ahead") |
+| T14 | Worker API in `nix647/vbb_device_backend` | us | pending (Phase B) |
+| T15 | ReID machine source; outbox/receipt routing; retract; caps | us | pending (Phase C) |
+| T16 | Board cost probe on rk3576 | owner | pending (Phase C) |
+| T18 | Licenses for chosen weights (+ interim eval permission) | owner | **BLOCKING production use**: the model that passed (InsightFace buffalo_l) is licensed for non-commercial research only. Either a commercial license from InsightFace, or a commercially usable model, which needs its own uniform new-names sample (about 183 labels at 0.98) |
+| T19 | Sharing threshold | owner | pending, before shadow is judged |
+| T20 | Export run (`export_machine_eval.php`) and upload | owner | done 2026-11-03 |
+| T21 | `gpu-ubun` facts | owner | done 2026-11-03: RTX 4070 Ti SUPER 16 GB, driver 580.178 / CUDA 13.0; disk `/` 54 GB free, `/vmdata` 77 GB free (use `/vmdata`); SSH to the boards works; board crops at `/home/linaro/vbb/.devdata/vbb/person_sightings/crops/` |
+| T22 | Worker repo created and named | owner | pending: code is ready locally (`vbb-reid-server`), needs a GitHub repo to push to |
+| T23 | `nix647/vbb` session or board developer for §5.6–5.7 | owner | pending |
+| T24 | Precision numbers (§8) | owner | pending |
+| T25 | Board DDL/config facts to re-verify: `configs/app.yaml` K=2 and `data_root`, `wide_detection_loop.py` drain, `reconcile_types.py` precedence, `evidence.py` upload path | later session | pending |
+
+T20 done 2026-11-03 (§3b). Answered 2026-11-03: the 8 ids are 4 humans (D8); `uncertain` is hidden in the feed (D9). Still unknown: face height inside the crops (needs the detector run); none of the earlier questions remain. The 4 roster ids with no labels (fac 2: 1 nurse; fac 3: 1 nurse, 2 parents) are test entries with no real person (owner 2026-11-03); they have no references, so the machine can never name them. Board 45 = 192.168.0.115 (LAN of gpu-ubun).
