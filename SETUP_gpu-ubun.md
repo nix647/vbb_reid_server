@@ -8,7 +8,7 @@ Layout used below:
 
 | What | Where | Why |
 |---|---|---|
-| Code + Python environment | `~/vbb_reid_server`, `~/venvs/vbbrs` (on `/`) | small; safe on any filesystem |
+| Code + Python environment | `~/vbb_reid_server`, `~/venvs/vbbrs` (on `/`). The box as it stands uses `/home/dosomi/dev/vbb_reid_server` and the shared `/home/dosomi/dev/ReID/.venv` | small; safe on any filesystem |
 | Data, crops, caches, weights, HF models | `/vmdata/vbb_eval/` | grows to tens of GB |
 
 ## 1. Check /vmdata's filesystem
@@ -492,9 +492,10 @@ embeds what the cache lacks, decides with the same code as `shadow`, then regist
 labels (inactive until someone activates them on the app host; the worker never activates), finishes,
 and deletes the crops it downloaded. Give it its own crop folder (`--cdn-cache /vmdata/vbb_run/cdn`),
 never the Phase A cache: it deletes what it downloads and anything older than a day. The backend
-side (`/worker/*`) is merged (2026-11-05) but needs the device backend deployed and a token issued;
-so far `run` is tested against an in-memory backend only. When the backend is up you will get a token
-file and these exact commands.
+side (`/worker/*`) is live (2026-11-05), and the token is in `~/.config/vbb_reid_server/worker.token`.
+The job is `scripts/nightly_run.sh`, at 00:05 facility time; it keeps the backend and the CDN off any
+proxy. Test with `scripts/nightly_run.sh --day <YYYY-MM-DD> --dry-run`. Logs are in `/vmdata/vbb_run/logs`;
+a failure adds a line to `/vmdata/vbb_run/FAILED`.
 
 ## 7. Notes
 
