@@ -30,7 +30,8 @@ Built on branch `claude/wonderful-hawking-vpm3va`, nothing deployed:
 - **B.4 worker** `nix647/vbb_reid_server@8f693c8` (0.2.1).
 - **Decisions applied:** D1 option B (card actions confirm machine members; audit keeps the run id), switch option B (no switch; off = facility_off reverts).
 - **Not built:** the staff app's mark and card warning (app developer; contract items), Phase C, the scheduled auto-activation (after G_B).
-- **Next for deploy (other team):** review the two alonsolee branches, apply `person_machine_labels.sql`, tag nursery, deploy device backend + app, issue the gpu-ubun token, then nightly `run` with labels inactive (B.5).
+- **Merged 2026-11-05 (owner: we merge our own repos), not deployed:** `person_machine_labels.sql` applied in production first; nursery `v0.0.111` (`6f9a653`), `alonsolee/vbb` branch `vbb_app` `ddafc6f2c`, `nix647/vbb_device_backend` main `05b974965`, vendored copies byte-identical to the tag. `vbb_contracts` is not merged: it belongs to someone else.
+- **Next:** deploy device backend + app (owner), `nursery:check-schema` on the app host, issue the gpu-ubun token, then nightly `run` with labels inactive (B.5).
 
 ## Adversarial review (2026-11-05): what changed in this plan
 

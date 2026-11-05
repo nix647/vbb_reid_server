@@ -30,7 +30,7 @@ sudo apt-get install -y python3-venv git
 ```
 
 ```bash
-cd ~ && git clone -b claude/wonderful-hawking-vpm3va https://github.com/nix647/vbb_reid_server
+cd ~ && git clone https://github.com/nix647/vbb_reid_server
 ```
 
 ```bash
@@ -108,6 +108,8 @@ vbb-reid-server summary --export /vmdata/vbb_eval/export --aliases /vmdata/vbb_e
 Expected: facility 2 with 9673 sightings, facility 3 with 17390, roster `H1`–`H4` plus the test ids.
 
 ## 4. Second crops from board 45 (read-only)
+
+Not needed since 2026-11-05: production uses only the uploaded picture (plan decision 27). This step stays only for re-running Phase A.
 
 ```bash
 cd ~/vbb_reid_server && scripts/rsync_board_crops.sh /vmdata/vbb_eval/crops 45=linaro@192.168.0.115
@@ -478,9 +480,10 @@ If the answers file of the new-names set has another name in `$A`, use that name
 
 **Send me** the three score lines and the four counts. What decides the next step: the 200-name
 sample was drawn from the Phase A pool, so it covers only the "same sighting, same person" names.
-If the other two counts are small, the 0.98 result carries over; if not, the production rule needs
-its own uniform sample of the names it alone produces (I will tell you how many labels before
-asking for any).
+If the other two counts are small, the sample still applies, but the bound must be recomputed on the
+sample's names the rule still produces (done 2026-11-05: counts 0 and 0, bound 0.9773 on 161 names;
+plan E11). If they are not small, the production rule needs its own uniform sample of the names it
+alone produces (I will tell you how many labels before asking for any).
 
 ## 6h. The production run (0.2.0): not yet
 
@@ -489,8 +492,9 @@ embeds what the cache lacks, decides with the same code as `shadow`, then regist
 labels (inactive until someone activates them on the app host; the worker never activates), finishes,
 and deletes the crops it downloaded. Give it its own crop folder (`--cdn-cache /vmdata/vbb_run/cdn`),
 never the Phase A cache: it deletes what it downloads and anything older than a day. The backend
-side (`/worker/*`) is not built yet, so there is nothing to run it against; it is tested against an
-in-memory backend only. When the backend is up you will get a token file and these exact commands.
+side (`/worker/*`) is merged (2026-11-05) but needs the device backend deployed and a token issued;
+so far `run` is tested against an in-memory backend only. When the backend is up you will get a token
+file and these exact commands.
 
 ## 7. Notes
 
