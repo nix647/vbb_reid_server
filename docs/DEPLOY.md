@@ -90,16 +90,22 @@ Reinstall only if dependencies changed. Test with a run that pushes nothing:
 /home/dosomi/dev/vbb_reid_server/scripts/nightly_run.sh --day <YYYY-MM-DD> --dry-run
 ```
 
-`scripts/nightly_run.sh` is the nightly job, for 00:05 facility time. It keeps the backend and the CDN off the proxy that login shells configure, and refuses to start if another run holds the lock. Output goes to `/vmdata/vbb_run/` (`logs/`, `runs/`, `emb/`, `cdn/`).
+`scripts/nightly_run.sh` is the nightly job, for 00:05 facility time. It keeps the backend and the CDN off the proxy that login shells configure, and refuses to start if another run holds the lock. Output goes to `/vmdata/vbb_eval/vbb_run/` (`logs/`, `runs/`, `emb/`, `cdn/`).
 
-**Schedule:** not installed as of 2026-11-05, pending the test runs.
+**Schedule:** in `dosomi`'s crontab on gpu-ubun. The box clock is UTC, so 00:05 Shanghai is written as 16:05. If the box's time zone ever changes, this line must change with it:
+
+```text
+5 16 * * * /home/dosomi/dev/vbb_reid_server/scripts/nightly_run.sh
+```
+
+A run stops after 3 hours. Exit 73 means the output folder could not be created, recorded in `~/vbb_run_FAILED`; exit 75 means another run holds the lock; exit 124 means the time limit.
 
 ## Operating it
 
-On gpu-ubun, look for failures. The file only exists if something failed, and nothing alerts you:
+On gpu-ubun, look for failures. These files only exist if something failed, and nothing alerts you:
 
 ```bash
-cat /vmdata/vbb_run/FAILED
+cat /vmdata/vbb_eval/vbb_run/FAILED ~/vbb_run_FAILED
 ```
 
 On the app host, see the runs and act on them:

@@ -490,12 +490,12 @@ alone produces (I will tell you how many labels before asking for any).
 `vbb-reid-server run` is the nightly job of Phase B: it pulls the day's sightings and the references,
 embeds what the cache lacks, decides with the same code as `shadow`, then registers a run, pushes the
 labels (inactive until someone activates them on the app host; the worker never activates), finishes,
-and deletes the crops it downloaded. Give it its own crop folder (`--cdn-cache /vmdata/vbb_run/cdn`),
+and deletes the crops it downloaded. Give it its own crop folder (`--cdn-cache /vmdata/vbb_eval/vbb_run/cdn`),
 never the Phase A cache: it deletes what it downloads and anything older than a day. The backend
 side (`/worker/*`) is live (2026-11-05), and the token is in `~/.config/vbb_reid_server/worker.token`.
 The job is `scripts/nightly_run.sh`, at 00:05 facility time; it keeps the backend and the CDN off any
-proxy. Test with `scripts/nightly_run.sh --day <YYYY-MM-DD> --dry-run`. Logs are in `/vmdata/vbb_run/logs`;
-a failure adds a line to `/vmdata/vbb_run/FAILED`.
+proxy. Test with `scripts/nightly_run.sh --day <YYYY-MM-DD> --dry-run`. Logs are in `/vmdata/vbb_eval/vbb_run/logs`;
+a failure adds a line to `/vmdata/vbb_eval/vbb_run/FAILED`.
 
 ## 7. Notes
 

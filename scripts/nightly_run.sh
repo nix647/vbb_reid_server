@@ -7,7 +7,8 @@ set -u
 
 CODE="$(cd "$(dirname "$0")/.." && pwd)"
 VENV="${VBB_RUN_VENV:-/home/dosomi/dev/ReID/.venv}"
-ROOT="${VBB_RUN_ROOT:-/vmdata/vbb_run}"
+ROOT="${VBB_RUN_ROOT:-/vmdata/vbb_eval/vbb_run}"
+MAX_TIME="${VBB_RUN_MAX_TIME:-3h}"  # a hung run must not hold the lock for every later night
 FACILITY="${VBB_RUN_FACILITY:-3}"
 BACKEND="${VBB_RUN_BACKEND:-https://vbb.yuexingren.cn}"
 TOKEN_FILE="${VBB_RUN_TOKEN_FILE:-$HOME/.config/vbb_reid_server/worker.token}"
@@ -20,7 +21,11 @@ export no_proxy="$BYPASS${no_proxy:+,$no_proxy}"
 export NO_PROXY="$BYPASS${NO_PROXY:+,$NO_PROXY}"
 export HF_HOME="${HF_HOME:-/vmdata/vbb_eval/hf}"
 
-mkdir -p "$ROOT/logs" "$ROOT/emb" "$ROOT/cdn" "$ROOT/runs"
+# $ROOT is unusable here, so the failure is recorded in the home folder instead.
+if ! mkdir -p "$ROOT/logs" "$ROOT/emb" "$ROOT/cdn" "$ROOT/runs"; then
+  echo "$(date -Iseconds) cannot create $ROOT" >> "$HOME/vbb_run_FAILED"
+  exit 73
+fi
 
 exec 9>"$ROOT/nightly.lock"
 if ! flock -n 9; then
@@ -30,7 +35,7 @@ fi
 
 LOG="$ROOT/logs/$(date +%Y%m%d-%H%M%S).log"
 cd "$CODE" || exit 1
-"$VENV/bin/vbb-reid-server" run \
+timeout --kill-after=5m "$MAX_TIME" "$VENV/bin/vbb-reid-server" run \
   --backend "$BACKEND" --token-file "$TOKEN_FILE" --facility "$FACILITY" --day auto \
   --point "$POINT" --models "$MODELS" \
   --emb "$ROOT/emb" --cdn-cache "$ROOT/cdn" --out "$ROOT/runs" "$@" >> "$LOG" 2>&1
