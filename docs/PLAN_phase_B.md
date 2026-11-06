@@ -30,8 +30,8 @@ Built on branch `claude/wonderful-hawking-vpm3va`, nothing deployed:
 - **B.4 worker** `nix647/vbb_reid_server@8f693c8` (0.2.1).
 - **Decisions applied:** D1 option B (card actions confirm machine members; audit keeps the run id), switch option B (no switch; off = facility_off reverts).
 - **Not built:** the staff app's mark and card warning (app developer; contract items), Phase C, the scheduled auto-activation (after G_B).
-- **Merged 2026-11-05 (owner: we merge our own repos), not deployed:** `person_machine_labels.sql` applied in production first; nursery `v0.0.111` (`6f9a653`), `alonsolee/vbb` branch `vbb_app` `ddafc6f2c`, `nix647/vbb_device_backend` main `05b974965`, vendored copies byte-identical to the tag. `vbb_contracts` is not merged: it belongs to someone else.
-- **Next:** deploy device backend + app (owner), `nursery:check-schema` on the app host, issue the gpu-ubun token, then nightly `run` with labels inactive (B.5).
+- **Merged and deployed 2026-11-05 (owner: we merge our own repos; deployed on the owner's word, `nursery:check-schema` OK):** `person_machine_labels.sql` applied in production first; nursery `v0.0.111` (`6f9a653`), `alonsolee/vbb` branch `vbb_app` `ddafc6f2c`, `nix647/vbb_device_backend` main `05b974965`, vendored copies byte-identical to the tag. `vbb_contracts` is not merged: it belongs to someone else.
+- **Next:** the gpu-ubun token is issued and saved. One real run was made by hand on the owner's word (plan E17), the owner reviewed it, and the nightly job was installed the same day: first run 2026-11-06 01:00 Shanghai, labels inactive. Next is the inactive week (B.5).
 
 ## Adversarial review (2026-11-05): what changed in this plan
 
@@ -128,7 +128,7 @@ Tests (in `alonsolee/vbb/tests/Nursery/`, sqlite harness; the package has no tes
 - Crops: `CropStore` with the CDN cache (decision 18) and the optional LAN root for test boards; embedding cache keyed as today, pruned at 14 days.
 - New command `run`: `vbb-reid-server run --facility 3 --day auto|YYYY-MM-DD --point point_3.json --models models.json --backend URL --token-file PATH [--lease-minutes 60] [--dry-run] [--activate]`. Steps: register (worker-minted `run_id`) → pull → embed → references → decide → push in batches of 500 (idempotent; a batch is retried whole) → finish `done` with counts (including `rejected` by reason) → optionally activate (admin token). Any exception → finish `failed` with the error string; the local CSV/JSON of the run are always written (`/vmdata/vbb_eval/runs/`). `--day auto` = yesterday in the facility's time zone; `--days A..B` for catch-up.
 - `model_id` = `"<face_detector_id>|<face_id>|<body_id or none>|vbb-reid-server <version>"`, the ids including preprocessing as today; the contract's `model_id` description is loosened to match.
-- Scheduling on gpu-ubun: `scripts/nightly_run.sh` at 00:05 Asia/Shanghai (facility 3's zone; owner 2026-11-05, was 02:30); a failure appends to `/vmdata/vbb_eval/vbb_run/FAILED`; the app-side `nursery:machine-run list --status failed` and a watchdog line in the morning check (owner's existing routine) cover alerting. No email from gpu-ubun.
+- Scheduling on gpu-ubun: `scripts/nightly_run.sh` at 01:00 Asia/Shanghai (facility 3's zone; owner 2026-11-05, was 02:30, then 00:05), installed in `dosomi`'s crontab; a failure appends to `/vmdata/vbb_eval/vbb_run/FAILED`; the app-side `nursery:machine-run list --status failed` and a watchdog line in the morning check (owner's existing routine) cover alerting. No email from gpu-ubun.
 - Tests: client paging/backoff with a fake server; `from_backend` builds the same `Export` as the CSV loader for a fixture day (same ids, same labels, same tz day); `run --dry-run` on the fixture produces the same labels as `shadow` for that day (the B.4 verify step from plan §7, done offline first, then once against the real backend).
 
 ### B.5 Shadow-in-DB, activation, drill (owner runs; we read)
@@ -190,4 +190,4 @@ B.0 half a day · B.1 two to three days (resolver, helper, five readers, tests) 
 | A facility's roster changes between pull and push (merge/delete) | Push validates against the roster at push time; a rejected row is counted, not retried blindly |
 | Worker names a sighting a human corrected minutes earlier | Push refuses (`human_labeled`); the resolver puts the human first anyway |
 | Two workers for one pair | Lease on `(facility, day)`; expired leases fail the old run |
-| Time-zone edge: run before local midnight | `--day auto` uses the facility's zone; the job fires at 00:05 local |
+| Time-zone edge: run before local midnight | `--day auto` uses the facility's zone; the job fires at 01:00 local |

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Nightly machine-label run on gpu-ubun (owner 2026-11-05: 00:05, facility time).
+# Nightly machine-label run on gpu-ubun (owner 2026-11-05: 01:00, facility time).
 # Labels stay inactive: the worker never activates. Extra arguments go to `run`, so
 #   scripts/nightly_run.sh --day 2026-11-02 --dry-run
 # tests the same path the nightly job uses. On failure it appends a line to $ROOT/FAILED.

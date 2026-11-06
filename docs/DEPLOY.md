@@ -90,13 +90,16 @@ Reinstall only if dependencies changed. Test with a run that pushes nothing:
 /home/dosomi/dev/vbb_reid_server/scripts/nightly_run.sh --day <YYYY-MM-DD> --dry-run
 ```
 
-`scripts/nightly_run.sh` is the nightly job, for 00:05 facility time. It keeps the backend and the CDN off the proxy that login shells configure, and refuses to start if another run holds the lock. Output goes to `/vmdata/vbb_eval/vbb_run/` (`logs/`, `runs/`, `emb/`, `cdn/`).
+`scripts/nightly_run.sh` is the nightly job, at 01:00 Shanghai time, which is facility 3's time. It keeps the backend and the CDN off the proxy that login shells configure, and refuses to start if another run holds the lock. Output goes to `/vmdata/vbb_eval/vbb_run/` (`logs/`, `runs/`, `emb/`, `cdn/`).
 
-**Schedule:** in `dosomi`'s crontab on gpu-ubun. The box clock is UTC, so 00:05 Shanghai is written as 16:05. If the box's time zone ever changes, this line must change with it:
+**Schedule:** installed on the owner's word on 2026-11-05, in `dosomi`'s crontab on gpu-ubun. The first run is 2026-11-06 01:00 Shanghai, for 11-05. The box clock is UTC, so 01:00 Shanghai is written as 17:00. If the box's time zone ever changes, this line must change with it:
 
 ```text
-5 16 * * * /home/dosomi/dev/vbb_reid_server/scripts/nightly_run.sh
+# Machine labels, nightly: 01:00 Shanghai. The box clock is UTC, so it is written as 17:00.
+0 17 * * * /home/dosomi/dev/vbb_reid_server/scripts/nightly_run.sh
 ```
+
+To stop the job, remove those lines with `crontab -e`. Labels already pushed stay inactive unless someone activates them.
 
 A run stops after 3 hours. Exit 73 means the output folder could not be created, recorded in `~/vbb_run_FAILED`; exit 75 means another run holds the lock; exit 124 means the time limit.
 
