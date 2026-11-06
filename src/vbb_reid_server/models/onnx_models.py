@@ -181,16 +181,29 @@ class OnnxFaceEmbedder:
 class OnnxBodyEmbedder:
     """Generic person-crop encoder (the board's ViT-S/16+ICS ONNX twin, CLIP-ReID or
     SOLIDER exports). Resizes to ``height`` x ``width`` (no letterbox, as ReID models
-    are trained), normalises with per-channel ``mean``/``std`` in 0..255 units."""
+    are trained), normalises with per-channel ``mean``/``std`` in 0..255 units.
+
+    ``resize``: ``"cv2"`` (INTER_LINEAR) or ``"pil"`` (PIL bilinear, which antialiases when it
+    shrinks; torchvision's Resize on a PIL image, which made the CLIP-ReID vectors the owner's
+    test was scored on). Needs pillow (``.[onnx]`` declares it). A threshold measured on
+    vectors from one resize does not transfer to the other (2026-11-06: 3 body names changed
+    person on facility 3), so it is part of the model id."""
 
     def __init__(self, path: str | Path, height: int = 256, width: int = 128, color: str = "RGB",
                  mean: tuple[float, float, float] = (123.675, 116.28, 103.53),
                  std: tuple[float, float, float] = (58.395, 57.12, 57.375),
-                 layout: str = "NCHW", flip: bool = False, batch: int = 64, providers: list[str] | None = None):
+                 layout: str = "NCHW", flip: bool = False, batch: int = 64, providers: list[str] | None = None,
+                 resize: str = "cv2"):
+        if resize not in ("cv2", "pil"):
+            raise ValueError(f"resize must be 'cv2' or 'pil', not {resize!r}")
+        if resize == "pil":
+            from PIL import Image  # pillow: only needed for this option
+            self._pil = Image
+        self.resize = resize
         self.path = Path(path)
         self.model_id = (f"{file_model_id(self.path)}:{int(height)}x{int(width)}:{color.upper()}:"
                          f"m{','.join(f'{x:g}' for x in mean)}:s{','.join(f'{x:g}' for x in std)}:{layout.upper()}"
-                         + (":flip" if flip else ""))
+                         + (":flip" if flip else "") + (":pil" if resize == "pil" else ""))
         self.session = _session(self.path, providers)
         inp = self.session.get_inputs()[0]
         self.input_name = inp.name
@@ -204,7 +217,11 @@ class OnnxBodyEmbedder:
         self.batch = self.static_batch or batch
 
     def _prep(self, crops: list[np.ndarray]) -> np.ndarray:
-        arr = np.stack([cv2.resize(c, (self.w, self.h), interpolation=cv2.INTER_LINEAR) for c in crops])
+        if self.resize == "pil":  # PIL resizes each channel alike, so the BGR order is kept here
+            arr = np.stack([np.asarray(self._pil.fromarray(np.ascontiguousarray(c)).resize(
+                (self.w, self.h), self._pil.Resampling.BILINEAR)) for c in crops])
+        else:
+            arr = np.stack([cv2.resize(c, (self.w, self.h), interpolation=cv2.INTER_LINEAR) for c in crops])
         if self.color == "RGB":
             arr = arr[..., ::-1]
         arr = (arr.astype(np.float32) - self.mean) / self.std

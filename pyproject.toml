@@ -23,8 +23,9 @@ dependencies = [
 
 [project.optional-dependencies]
 # ONNX models (SCRFD, ArcFace/AdaFace exports, the board's own models via the gpu-ubun ONNX port).
-onnx = ["onnxruntime-gpu>=1.17"]
-onnx-cpu = ["onnxruntime>=1.17"]
+# pillow: the body models' "resize": "pil" option (the nightly CLIP-ReID body model uses it).
+onnx = ["onnxruntime-gpu>=1.17", "pillow>=10"]
+onnx-cpu = ["onnxruntime>=1.17", "pillow>=10"]
 # Hugging Face vision encoders (SigLIP2, DINOv3) for the body/appearance path.
 hf = ["torch>=2.3", "transformers>=4.56", "pillow>=10"]
 # dev never pulls an onnxruntime build itself: the CPU and GPU builds install the same module, and
