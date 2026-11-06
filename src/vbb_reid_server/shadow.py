@@ -30,7 +30,8 @@ def _cutoff(ws: Workspace, facility: str, day: str, label_cutoff_ms):
 
 LABEL_FIELDS = ["run_id", "sighting_id", "facility_id", "day", "did", "room_id", "board_state",
                 "board_person_id", "state", "relation", "person_id", "person_key", "via", "confidence",
-                "margin", "face_sim", "body_sim", "human_labeled", "evidence"]
+                "margin", "face_sim", "body_sim", "human_labeled", "evidence",
+                "image_url"]  # last: the verification page shows this picture (added 0.2.3)
 
 
 def decide_night(ws: Workspace, facility: str, day: str, th: Thresholds, policy: RefPolicy,
@@ -54,11 +55,12 @@ def decide_night(ws: Workspace, facility: str, day: str, th: Thresholds, policy:
 def shadow_run(ws: Workspace, facility: str, day: str, th: Thresholds, out_dir: str | Path, *,
                policy: RefPolicy = RefPolicy(include_same_day=True), label_cutoff_ms: int | str | None = RUN_AT_DAY_END,
                model_name: str = "", run_id: str | None = None, decided: dict | None = None,
-               report_key=None, log=print) -> dict:
+               report_key=None, extra: dict | None = None, log=print) -> dict:
     """``label_cutoff_ms``: ``"run"`` (default, production-like), an epoch-ms value, or ``None``
     (every label in the export — only for debugging; it leaks the future).
     ``decided``: a ``decide_night`` result to write instead of deciding again (the production run).
-    ``report_key``: person_id -> key written in ``person_key`` (default: the decision's own key)."""
+    ``report_key``: person_id -> key written in ``person_key`` (default: the decision's own key).
+    ``extra``: more fields for the run JSON (the production run records ``dry_run``)."""
     ex = ws.export
     run_id = run_id or uuid.uuid4().hex
     started = time.time()
@@ -89,6 +91,7 @@ def shadow_run(ws: Workspace, facility: str, day: str, th: Thresholds, out_dir: 
                 "face_sim": "" if l.face_sim is None else l.face_sim,
                 "body_sim": "" if l.body_sim is None else l.body_sim,
                 "human_labeled": int(human), "evidence": json.dumps(l.evidence, ensure_ascii=False),
+                "image_url": s.image_url or "",
             })
     run = {
         "run_id": run_id, "facility_id": facility, "day": day, "model": model_name,
@@ -96,6 +99,7 @@ def shadow_run(ws: Workspace, facility: str, day: str, th: Thresholds, out_dir: 
         "ref_policy": policy.__dict__, "label_cutoff_ms": label_cutoff_ms,
         "references": {k: refs.n_sightings(k) for k in refs}, "same_day_seeds": len(seeds),
         "counts": counts, "started_at": started, "finished_at": time.time(),
+        **(extra or {}),
     }
     (out / f"run_{facility}_{day}_{run_id[:8]}.json").write_text(json.dumps(run, indent=2, ensure_ascii=False))
     log(f"[shadow] {facility} {day} run {run_id[:8]}: {counts}")

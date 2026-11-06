@@ -356,6 +356,45 @@ def cmd_prune(args) -> None:
     print(f"[prune] removed {n_c} cached crops, {n_e} embedding files older than {args.days} days")
 
 
+def cmd_verify_refs(args) -> None:
+    import numpy as np
+
+    from .embed import load_face
+    from .verify import pick_references
+    ex = load_export(args.export, args.aliases)
+    face_id = _ids_from_cache(args.emb, "face", args.face_model)
+    tables: dict = {}
+
+    def one_face(s) -> bool:  # the uploaded picture (crop 0) shows exactly one face
+        k = (s.facility_id, s.day)
+        if k not in tables:
+            tables[k] = load_face(Path(args.emb), face_id, *k)
+        t = tables[k]
+        rows = np.flatnonzero((t.sighting_id == s.sighting_id) & (t.crop_idx == 0))
+        return len(rows) > 0 and all(t.n_faces[i] == 1 and t.second_ratio[i] == 0 for i in rows)
+
+    refs = pick_references(ex, args.facility, [Path(f) for f in args.answers], one_face=one_face,
+                           exclude=set(args.exclude or []), per_person=args.per_person)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(refs, indent=1, ensure_ascii=False), encoding="utf-8")
+    for p in refs["people"]:
+        print(f"[verify-refs] {p['key']}: {len(p['photos'])} picture(s) over {len({x['day'] for x in p['photos']})} day(s)")
+    print(f"[verify-refs] dropped: {refs['dropped']}\n[verify-refs] written to {out}")
+
+
+def cmd_verify_build(args) -> None:
+    from .verify import build_night
+    for day in _run_days(args):
+        build_night(Path(args.runs), Path(args.refs), Path(args.out), str(args.facility), day, n=args.n,
+                    run_id=args.run_id)
+
+
+def cmd_verify_serve(args) -> None:
+    from .verify import serve
+    serve(Path(args.root), args.port)
+
+
 def cmd_quality_report(args) -> None:
     from .quality_report import report
     ex = load_export(args.export, args.aliases)
@@ -595,6 +634,33 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--quality")
     sp.add_argument("--refs-mode", choices=["temporal", "lodo"], default="temporal")
     sp.set_defaults(fn=cmd_inspect)
+
+    sp = sub.add_parser("verify-refs", help="reference pictures per person for the verification page (once)")
+    common(sp)
+    sp.add_argument("--facility", required=True)
+    sp.add_argument("--face-model", required=True, help="cached face model (slug or substring), for the one-face check")
+    sp.add_argument("--answers", nargs="+", required=True,
+                    help="answers given one picture at a time: adjudication CSVs or a review page's marks.json")
+    sp.add_argument("--exclude", nargs="*", help="sighting ids never to show as a reference")
+    sp.add_argument("--per-person", type=int, default=6)
+    sp.add_argument("--out", required=True, help="refs.json")
+    sp.set_defaults(fn=cmd_verify_refs)
+
+    sp = sub.add_parser("verify-build", help="draw a night's sample for the verification page (nightly, after run)")
+    sp.add_argument("--runs", required=True, help="the run's --out folder")
+    sp.add_argument("--refs", required=True, help="refs.json from verify-refs")
+    sp.add_argument("--out", required=True, help="verification root (one folder per night)")
+    sp.add_argument("--facility", required=True)
+    sp.add_argument("--day", default="auto", help="auto (yesterday, facility time), YYYY-MM-DD, or A..B")
+    sp.add_argument("--tz", default="Asia/Shanghai")
+    sp.add_argument("--n", type=int, default=20)
+    sp.add_argument("--run-id", help="this run instead of the newest non-dry one (one day only)")
+    sp.set_defaults(fn=cmd_verify_build)
+
+    sp = sub.add_parser("verify-serve", help="the verification page on 127.0.0.1, for an ssh tunnel")
+    sp.add_argument("--root", required=True, help="verification root")
+    sp.add_argument("--port", type=int, default=8770)
+    sp.set_defaults(fn=cmd_verify_serve)
 
     sp = sub.add_parser("doctor")
     sp.add_argument("--models", help="model config JSON to load as a test")

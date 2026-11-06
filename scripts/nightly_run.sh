@@ -43,5 +43,14 @@ rc=$?
 if [ "$rc" -ne 0 ]; then
   echo "$(date -Iseconds) rc=$rc log=$LOG" >> "$ROOT/FAILED"
 fi
+
+# Verification page: draw tonight's sample once the run is done (skipped for a dry run, an extra-argument
+# run, or when no reference file exists). Its failure is recorded but does not change the run's exit code.
+REFS="${VBB_VERIFY_REFS:-$ROOT/verify/refs.json}"
+if [ "$rc" -eq 0 ] && [ "$#" -eq 0 ] && [ -f "$REFS" ]; then
+  "$VENV/bin/vbb-reid-server" verify-build --runs "$ROOT/runs" --refs "$REFS" --out "$ROOT/verify" \
+    --facility "$FACILITY" --day auto >> "$LOG" 2>&1 \
+    || echo "$(date -Iseconds) verify-build failed log=$LOG" >> "$ROOT/FAILED"
+fi
 find "$ROOT/logs" -name '*.log' -mtime +30 -delete
 exit "$rc"

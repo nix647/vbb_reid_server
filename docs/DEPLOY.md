@@ -96,10 +96,15 @@ Reinstall only if dependencies changed. Test with a run that pushes nothing:
 
 ```text
 # Machine labels, nightly: 01:00 Shanghai. The box clock is UTC, so it is written as 17:00.
-0 17 * * * /home/dosomi/dev/vbb_reid_server/scripts/nightly_run.sh
+# Face only, until 2026-11-06 (owner: "Turn on the body part for our correction job"):
+# 0 17 * * * /home/dosomi/dev/vbb_reid_server/scripts/nightly_run.sh
+# Face + CLIP-ReID body (vbb-reid-server 0.2.2, "resize": "pil"), from 2026-11-07 01:00 Shanghai:
+0 17 * * * VBB_RUN_POINT=/vmdata/vbb_eval/models/point_3_clipreid_body.json VBB_RUN_MODELS=/vmdata/vbb_eval/models/buffalo_l_face_clipreid_body.json /home/dosomi/dev/vbb_reid_server/scripts/nightly_run.sh
 ```
 
-To stop the job, remove those lines with `crontab -e`. Labels already pushed stay inactive unless someone activates them.
+Body was switched on 2026-11-06 14:45 Shanghai (plan decision 32). The two files it names are read-only. Before the switch, a replay at the frozen line matched E20 on 12,289 of 12,290 labels: none changed person and no E20 picture changed. The 4 that differed are right at the line and come from onnxruntime's CUDA TF32 default, which is not pinned. A dry run of 11-05 also matched. To go back to face only, `crontab /vmdata/vbb_eval/out/crontab_before_body_20261106-064513.txt`. To stop the job, remove those lines with `crontab -e`. Labels already pushed stay inactive unless someone activates them.
+
+gpu-ubun could not reach GitHub on 2026-11-06 (the proxy failed upstream, and a direct connection timed out), so 0.2.2 arrived as a git bundle made on the Mac and fast-forwarded. Check `git -C /home/dosomi/dev/vbb_reid_server log -1` against GitHub main before trusting a pull.
 
 A run stops after 3 hours. Exit 73 means the output folder could not be created, recorded in `~/vbb_run_FAILED`; exit 75 means another run holds the lock; exit 124 means the time limit.
 
@@ -127,6 +132,31 @@ php artisan nursery:machine-run on --facility=3
 - `revert` undoes one bad night. `off` undoes all of a facility's nights, and `on` brings back the ones `off` removed.
 - Changes show on the next read of the review page, with no restart.
 - `nursery:machine-run expire` runs hourly by itself on the app host's scheduler.
+
+## Checking each night's names (0.2.3)
+
+After each successful nightly run, `nightly_run.sh` draws 20 of that night's new names (pushed `known` promotions) into `/vmdata/vbb_eval/vbb_run/verify/<facility>_<day>/frozen.json`, read-only. It does this only when `verify/refs.json` exists, and only once per night. A failed draw adds a `verify-build failed` line to `FAILED` without failing the run.
+
+To review, run this on your own computer and leave it running. It starts the page on gpu-ubun for as long as the ssh session lasts:
+
+```bash
+ssh -L 8770:127.0.0.1:8770 dosomi@192.168.0.107 \
+  /home/dosomi/dev/ReID/.venv/bin/vbb-reid-server verify-serve --root /vmdata/vbb_eval/vbb_run/verify --port 8770
+```
+
+Then open `http://localhost:8770/`. If ssh exits with an error, or the page doesn't load, nothing is served. The page lists the nights. A night shows one picture at a time beside reference pictures of each person, and asks who it is. The machine's name, scores and picture links never reach the page. After "I'm done", the list shows that night's result, totals by face and body and by person, with the 97.5 % lower bound, and the wrong names with their pictures.
+
+Reference pictures (`refs.json`) are built once, and again when the roster changes. They come only from answers the owner gave one picture at a time and blind, never from bulk labels. Each must show exactly one face, agree with its human label if it has one, and not be on the exclude list:
+
+```bash
+cd /home/dosomi/dev/vbb_reid_server
+/home/dosomi/dev/ReID/.venv/bin/vbb-reid-server verify-refs --export <phase A export> --aliases <aliases.csv> \
+  --emb <phase A emb root> --face-model buffalo --facility 3 --answers <answer files…> \
+  --exclude a2edee5618ff 36aed033c5b4 07e911a53a04 81e8e70dc82f 83c78b81f9ed 371e6e5c751c \
+  --out /vmdata/vbb_eval/vbb_run/verify/refs.json
+```
+
+A night that was drawn before a change to `refs.json` keeps the references it was drawn with. Answers live in `marks.json`, with one line per save in `marks.log`, next to each night's `frozen.json`.
 
 ## Known gaps
 

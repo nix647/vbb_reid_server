@@ -183,7 +183,8 @@ def run_night(client: BackendClient, facility_id: int, day: str, *, th: Threshol
         ws = Workspace(ex, emb_root, face_id, body_id, quality)
         decided = decide_night(ws, fac, day, th, policy, label_cutoff_ms=started)
         local = shadow_run(ws, fac, day, th, out_dir, policy=policy, label_cutoff_ms=started,
-                           model_name=model_id, run_id=run_id, decided=decided, log=log)
+                           model_name=model_id, run_id=run_id, decided=decided,
+                           extra={"dry_run": dry_run}, log=log)
         by_sid = {s.sighting_id: s for s in decided["sightings"]}
         keep = [l for l in decided["labels"] if not by_sid[l.sighting_id].has_overlay]
         rows = [label_row(l) for l in keep]
