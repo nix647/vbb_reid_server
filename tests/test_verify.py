@@ -248,3 +248,21 @@ def test_pages_refuse_a_foreign_host_name(server):
     for path in ("/", f"/n/{night}", f"/n/{night}/marks", f"/img/{night}/0"):
         assert _req(base + path, headers={"Host": "evil.example"})[0] == 403, path
     assert fetched == []
+
+
+def test_people_without_reference_pictures_are_not_offered(tmp_path):
+    root, night = _night(tmp_path)  # H2 has no reference pictures in _refs
+    data = page_data(Store(root).frozen(night))
+    assert [p["key"] for p in data["people"]] == ["H1"]
+
+
+def test_a_hidden_person_does_not_shift_the_others_reference_pictures(server):
+    base, night, root, fetched = server
+    f = root / night / "frozen.json"
+    data = json.loads(f.read_text())
+    data["people"].insert(0, {"person_id": "p0", "key": "H0", "name": "", "photos": []})  # empty, first
+    os.chmod(f, 0o644)
+    f.write_text(json.dumps(data))
+    pd = page_data(Store(root).frozen(night))
+    assert [(p["key"], p["ref"]) for p in pd["people"]] == [("H1", 1)]
+    assert _req(f"{base}/ref/{night}/1/0") == (200, b"JPEG") and fetched == [URL.format("r1")]

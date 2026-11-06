@@ -267,8 +267,12 @@ class Store:
 
 
 def page_data(fz: dict) -> dict:
-    """What the reviewer's page receives: labels, names and picture counts. No machine output, no links."""
-    people = [{"key": p["key"], "name": p.get("name", ""), "photos": len(p["photos"])} for p in fz["people"]]
+    """What the reviewer's page receives: labels, names and picture counts. No machine output, no links.
+    Only people with reference pictures are offered: one nobody can recognise is no use as a choice, and a
+    person without a single labeled picture has no references, so the machine cannot name them either.
+    ``ref`` keeps the person's place in ``frozen.json`` for ``/ref/<night>/<ref>/<j>``."""
+    people = [{"key": p["key"], "name": p.get("name", ""), "photos": len(p["photos"]), "ref": i}
+              for i, p in enumerate(fz["people"]) if p["photos"]]
     return {"day": fz["day"], "n": len(fz["items"]), "people": people}
 
 
@@ -453,8 +457,7 @@ const choices = D.people.map((p, i) => ({v: p.key, label: (i + 1) + ". " + p.key
   .concat([{v: "other", label: "o. Stranger or someone else"}, {v: "cant_tell", label: "x. Can't tell"}]);
 D.people.forEach((p, i) => { const row = document.createElement("div"); row.className = "ref";
   const b = document.createElement("b"); b.textContent = (i + 1) + ". " + p.key + (p.name ? " · " + p.name : ""); row.appendChild(b);
-  if (!p.photos) { const s = document.createElement("span"); s.className = "muted"; s.textContent = "no reference picture"; row.appendChild(s); }
-  for (let j = 0; j < p.photos; j++) { const im = document.createElement("img"); im.loading = "lazy"; im.src = "/ref/" + NIGHT + "/" + i + "/" + j; row.appendChild(im); }
+  for (let j = 0; j < p.photos; j++) { const im = document.createElement("img"); im.loading = "lazy"; im.src = "/ref/" + NIGHT + "/" + p.ref + "/" + j; row.appendChild(im); }
   $("refs").appendChild(row); });
 choices.forEach(c => { const b = document.createElement("button"); b.textContent = c.label; b.dataset.v = c.v;
   b.onclick = () => { b.blur(); answer(c.v); }; $("choices").appendChild(b); });  // blur: Enter must not repeat it
