@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from helpers import basis, near, sighting, unit
-from vbb_reid_server.decide import Thresholds, decide_day, face_scores
+from vbb_reid_server.decide import Thresholds, _cannot_link, decide_day, face_scores
 
 RNG = np.random.default_rng(0)
 A, B, C = basis(0), basis(1), basis(2)
@@ -131,6 +131,91 @@ def test_simultaneous_tracks_on_one_board_never_merge():
     body = {"seed": near(body_a, 0.02, RNG), "twin": near(body_a, 0.02, RNG)}
     out = run([seed, twin], {"seed": [face("seed", near(A, 0.05, RNG))]}, th=BTH, body=body)
     assert "twin" not in out  # guard: cannot-link
+
+
+# A joined sighting: one person's consecutive tracks sent as one sighting (backend ``joined_tracks``).
+JOINED_TRACKS = [(0, 18_000), (20_000, 41_000), (43_000, 62_000)]
+
+
+def joined_seed():
+    return sighting("seed", t0=0, t1=62_000, spans=JOINED_TRACKS)
+
+
+def test_a_picture_in_a_gap_of_a_joined_sighting_can_take_its_name():
+    # The same person's unnamed track between two of the joined tracks. Nothing else was being
+    # tracked as this person at that moment, so nothing says it is someone else.
+    gap = sighting("gap", t0=18_500, t1=19_500, crop_is_face=False)
+    body_a = basis(10)
+    body = {"seed": near(body_a, 0.05, RNG), "gap": near(body_a, 0.05, RNG)}
+    out = run([joined_seed(), gap], {"seed": [face("seed", near(A, 0.05, RNG))]}, th=BTH, body=body)
+    assert (out["gap"].state, out["gap"].person_id, out["gap"].via) == ("known", "pA", "body")
+
+
+def test_a_picture_during_one_of_the_joined_tracks_is_someone_else():
+    twin = sighting("twin", t0=30_000, t1=31_000, crop_is_face=False)
+    body_a = basis(10)
+    body = {"seed": near(body_a, 0.02, RNG), "twin": near(body_a, 0.02, RNG)}
+    out = run([joined_seed(), twin], {"seed": [face("seed", near(A, 0.05, RNG))]}, th=BTH, body=body)
+    assert "twin" not in out  # guard: cannot-link against the tracks themselves
+
+
+def spanned(sid, spans, did="45"):
+    return sighting(sid, did=did, t0=min(s for s, _ in spans), t1=max(e for _, e in spans),
+                    spans=spans if len(spans) > 1 else None)
+
+
+@pytest.mark.parametrize("a, b, expected", [
+    ([(0, 10)], [(5, 15)], True),
+    ([(0, 10)], [(10, 20)], True),   # the same instant counts
+    ([(0, 10)], [(11, 20)], False),
+    ([(0, 10), (20, 30)], [(12, 18)], False),   # inside the gap
+    ([(0, 10), (20, 30)], [(2, 4)], True),      # during the first track
+    ([(0, 10), (20, 30)], [(25, 26)], True),    # during the last track
+    ([(0, 10), (20, 30)], [(11, 19), (31, 40)], False),  # two joined sightings taking turns
+    ([(0, 10), (20, 30)], [(11, 19), (29, 40)], True),   # their last tracks overlap
+])
+def test_cannot_link_compares_the_tracks(a, b, expected):
+    assert bool(_cannot_link([spanned("a", a), spanned("b", b)])[0, 1]) is expected
+    assert bool(_cannot_link([spanned("b", b), spanned("a", a)])[0, 1]) is expected, "whichever comes first"
+
+
+@pytest.mark.parametrize("spans, t0, t1, trusted", [
+    ([(0, 10), (20, 30)], 0, 30, True),
+    ([(0, 50), (10, 20)], 0, 50, True),    # the latest end need not be the last entry's: tracks can overlap
+    ([(5, 10), (20, 30)], 0, 30, False),   # the first track is missing
+    ([(0, 10), (20, 25)], 0, 30, False),   # the last track is missing
+    ([(0, 30)], 0, 30, False),             # one survivor is not a joined sighting
+])
+def test_a_track_list_that_does_not_reach_both_ends_is_not_trusted(spans, t0, t1, trusted):
+    # A missing track's time would stop blocking anyone, and a missing track can only come from a bug.
+    # The whole span blocks more, so the machine names fewer pictures rather than wrong ones.
+    s = sighting("s", t0=t0, t1=t1, spans=spans)
+    base = s.track_started_ts - t0
+    assert s.intervals_ms == (tuple((base + a, base + b) for a, b in spans) if trusted else ((base + t0, base + t1),))
+
+
+def test_cannot_link_is_per_board_and_never_links_a_sighting_to_itself():
+    assert not _cannot_link([spanned("a", [(0, 10)], did="45"), spanned("b", [(0, 10)], did="46")])[0, 1]
+    # Two tracks of one person can overlap in time; they are still one sighting.
+    assert not _cannot_link([spanned("a", [(0, 10), (5, 15)])])[0, 0]
+
+
+def test_cannot_link_matches_a_brute_force_check_on_random_days():
+    rng = np.random.default_rng(7)
+    for _ in range(40):
+        people = []
+        for i in range(30):
+            t, spans = int(rng.integers(0, 500)), []
+            for _ in range(int(rng.integers(1, 5))):
+                d = int(rng.integers(1, 40))
+                spans.append((t, t + d))
+                t += d + int(rng.integers(-5, 30))
+            people.append((str(rng.integers(0, 3)), spans))
+        got = _cannot_link([spanned(f"s{i}", spans, did=did) for i, (did, spans) in enumerate(people)])
+        for i, (did_a, spans_a) in enumerate(people):
+            for j, (did_b, spans_b) in enumerate(people):
+                want = i != j and did_a == did_b and any(a0 <= b1 and b0 <= a1 for a0, a1 in spans_a for b0, b1 in spans_b)
+                assert bool(got[i, j]) is want, (i, j, spans_a, spans_b)
 
 
 def test_cluster_with_two_named_seeds_never_merges():

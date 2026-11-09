@@ -16,6 +16,7 @@ registered in several facilities shares one key (owner 2026-11-03: facilities
 from __future__ import annotations
 
 import csv
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -46,6 +47,27 @@ def _str(v: str | None) -> str | None:
     return v if v not in (None, "") else None
 
 
+def joined_spans(entries) -> tuple[tuple[int, int], ...]:
+    """Each track of a joined sighting, ``(start_ms, end_ms)`` in start order, from the backend's
+    ``joined_tracks``. An entry that is not two integer times in order is left out; nothing usable
+    is ``()``, which reads as an ordinary one-track sighting."""
+    spans = []
+    for e in entries if isinstance(entries, list) else []:
+        start = e.get("track_started_ts") if isinstance(e, dict) else None
+        end = e.get("track_ended_ts") if isinstance(e, dict) else None
+        if type(start) is int and type(end) is int and start <= end:
+            spans.append((start, end))
+    return tuple(sorted(spans))
+
+
+def _csv_joined_spans(extras: str | None) -> tuple[tuple[int, int], ...]:
+    try:
+        parsed = json.loads(extras) if extras else None
+    except ValueError:
+        return ()
+    return joined_spans(parsed.get("joined_tracks")) if isinstance(parsed, dict) else ()
+
+
 @dataclass(frozen=True)
 class Sighting:
     sighting_id: str
@@ -68,6 +90,7 @@ class Sighting:
     human_person_id: str | None
     corrected_ts: int | None  # ms
     day: str  # facility-local YYYY-MM-DD of capture_ts
+    joined_spans_ms: tuple[tuple[int, int], ...] = ()  # each track of a joined sighting; () = one track
 
     @property
     def human_labeled(self) -> bool:
@@ -86,6 +109,20 @@ class Sighting:
         if end < start:
             start, end = end, start
         return start, end
+
+    @property
+    def intervals_ms(self) -> tuple[tuple[int, int], ...]:
+        """When this person was really being tracked. A joined sighting's top-level span also covers
+        the gaps between its tracks, so it answers from the tracks themselves.
+
+        The board sends that span as the tracks' earliest start and latest end. A list that does not
+        reach both ends is missing tracks: use the whole span, which blocks more and so can only name
+        fewer pictures."""
+        whole = self.interval_ms
+        spans = self.joined_spans_ms
+        if spans and spans[0][0] == whole[0] and max(end for _, end in spans) == whole[1]:
+            return spans
+        return (whole,)
 
 
 @dataclass
@@ -271,6 +308,7 @@ def load_export(root: str | Path, aliases_csv: str | Path | None = None) -> Expo
             human_person_id=_str(r.get("corrected_person_id")) if hs == "known" else None,
             corrected_ts=_int(r.get("corrected_ts")),
             day=local_day(cap, facility_tz.get(fac, "Asia/Shanghai")),
+            joined_spans_ms=_csv_joined_spans(r.get("extras")),
         ))
     sightings.sort(key=lambda s: (s.facility_id, s.capture_ts, s.sighting_id))
     aliases, names = load_aliases(Path(aliases_csv) if aliases_csv else None)

@@ -14,7 +14,7 @@ import pytest
 
 from helpers import FACE_ID, basis, near, sighting, write_face_cache
 from vbb_reid_server.api import BackendClient, BackendError, export_from_backend
-from vbb_reid_server.data import Export, Person
+from vbb_reid_server.data import Export, Person, joined_spans
 from vbb_reid_server.decide import Thresholds
 from vbb_reid_server.pipeline import RefPolicy, Workspace
 from vbb_reid_server.quality import QualityPolicy
@@ -234,6 +234,38 @@ def test_the_export_keeps_overlays_and_puts_same_day_labels_on_their_probe():
     assert (by["x1"].facility_id, by["x1"].day, by["x1"].human_person_id) == ("2", "2026-10-19", "pA")
     assert ex.roster_ids("3") == {"pA", "pB"}
     assert [s.sighting_id for s in ex.by_facility_day("3", "2026-10-20")] == ["p1", "p2", "p3", "p4"]
+
+
+def test_the_export_keeps_each_track_of_a_joined_sighting():
+    t = ms(2026, 10, 20)
+    entry = lambda tid, a, b: {"track_id": tid, "track_started_ts": a, "track_ended_ts": b}
+    rows = [_probe("joined", t, track_started_ts=t - 30_000,
+                   joined_tracks=[entry(15, t - 10_000, t), entry(12, t - 30_000, t - 20_000)]),
+            _probe("null", t, joined_tracks=None),
+            _probe("older_backend", t)]
+    ex = export_from_backend(client_for(FakeBackend(rows, [], ROSTER)), 3, "2026-10-20", window_days=60)
+
+    by = {s.sighting_id: s for s in ex.sightings}
+    assert by["joined"].intervals_ms == ((t - 30_000, t - 20_000), (t - 10_000, t)), "in start order"
+    for sid in ("null", "older_backend"):
+        assert by[sid].intervals_ms == ((t - 1000, t),), f"{sid}: an ordinary one-track sighting"
+
+
+@pytest.mark.parametrize("bad", [
+    {"track_id": 13}, "x", 7, None, [1, 2],
+    {"track_started_ts": 5, "track_ended_ts": 1},       # reversed
+    {"track_started_ts": "1", "track_ended_ts": "2"},
+    {"track_started_ts": 1.0, "track_ended_ts": 2.0},   # the backend only ever stores integer milliseconds
+    {"track_started_ts": True, "track_ended_ts": True},
+])
+def test_a_bad_track_entry_costs_only_itself(bad):
+    good = {"track_started_ts": 10, "track_ended_ts": 20}
+    assert joined_spans([good, bad]) == ((10, 20),)
+
+
+@pytest.mark.parametrize("not_a_list", [None, "x", 7, {"track_started_ts": 1, "track_ended_ts": 2}])
+def test_track_entries_must_be_a_list(not_a_list):
+    assert joined_spans(not_a_list) == ()
 
 
 def test_a_facility_in_another_time_zone_is_refused():

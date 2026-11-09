@@ -31,7 +31,7 @@ from datetime import date, datetime, timedelta
 from typing import Callable, Iterator
 from zoneinfo import ZoneInfo
 
-from .data import BOARD_STATES, Export, Person, Sighting, local_day
+from .data import BOARD_STATES, Export, Person, Sighting, joined_spans, local_day
 
 OK = 200
 RETRY_CODES = {500, 5003}  # ERROR_CODE_SERVICE_UNAVAILABLE, ERROR_CODE_MAINTAINED_MODE
@@ -243,7 +243,8 @@ def export_from_backend(client: BackendClient, facility_id: int, day: str, *, wi
             crop_quality=r.get("crop_quality"), crop_is_face=bool(r.get("crop_is_face")), crop_count=1,
             image_url=_s(r.get("image_url")), capture_ts=int(r["capture_ts"]),
             track_started_ts=r.get("track_started_ts"), track_ended_ts=r.get("track_ended_ts"),
-            human_state=hs, human_person_id=None, corrected_ts=None, day=day)
+            human_state=hs, human_person_id=None, corrected_ts=None, day=day,
+            joined_spans_ms=joined_spans(r.get("joined_tracks")))
 
     for r in refs:
         sid = str(r["sighting_id"])

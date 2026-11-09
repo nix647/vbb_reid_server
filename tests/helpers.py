@@ -33,7 +33,7 @@ def near(base: np.ndarray, noise: float, rng: np.random.Generator) -> np.ndarray
 def sighting(sid: str, *, did: str = "45", facility: str = "3", day: str = "2026-10-20",
              board_state: str = "stranger", board_pid: str | None = None, t0: int = 0, t1: int | None = None,
              human_state: str | None = None, human_pid: str | None = None, corrected_ts: int | None = None,
-             crop_is_face: bool = True) -> Sighting:
+             crop_is_face: bool = True, spans: list[tuple[int, int]] | None = None) -> Sighting:
     base = 1_792_000_000_000
     return Sighting(
         sighting_id=sid, did=did, room_id="9", facility_id=facility, track_id=None,
@@ -42,7 +42,8 @@ def sighting(sid: str, *, did: str = "45", facility: str = "3", day: str = "2026
         crop_count=1, image_url=f"https://cdn.example/{sid}.jpg", capture_ts=base + (t1 if t1 is not None else t0),
         track_started_ts=base + t0, track_ended_ts=base + (t1 if t1 is not None else t0 + 1000),
         human_state=human_state, human_person_id=human_pid if human_state == "known" else None,
-        corrected_ts=corrected_ts, day=day)
+        corrected_ts=corrected_ts, day=day,
+        joined_spans_ms=tuple((base + a, base + b) for a, b in spans or ()))
 
 
 def write_csv(path: Path, header: list[str], rows: list[list]) -> None:

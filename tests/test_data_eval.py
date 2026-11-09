@@ -163,3 +163,18 @@ def test_the_grid_can_sweep_the_quality_floor(tmp_path):
                             days=["2026-10-20"], loo=False, log=lambda *_: None)
     by_q = {r.th.face_q_min: r for r in res}
     assert by_q[0.0].total.correct == 6 and by_q[0.95].total.labeled == 0  # all test faces have qf 0.9
+
+
+def test_the_csv_export_reads_the_tracks_of_a_joined_sighting(tmp_path):
+    joined = '{"crop_face_box": [0.1, 0.1, 0.2, 0.2], "joined_tracks": [{"track_id": 2, "track_ended_ts": 40, "track_started_ts": 30},' \
+             ' {"track_id": 1, "track_ended_ts": 20, "track_started_ts": 10}]}'
+    base = {"facility_id": "3", "capture_ts": 40, "track_started_ts": 10, "track_ended_ts": 40}
+    root = tmp_path / "export"
+    write_export(root, [{**base, "sighting_id": "joined", "extras": joined},
+                        {**base, "sighting_id": "box_only", "extras": '{"crop_face_box": [0.1, 0.1, 0.2, 0.2]}'},
+                        {**base, "sighting_id": "broken", "extras": "not json"},
+                        {**base, "sighting_id": "plain"}], PEOPLE)
+    by = {s.sighting_id: s for s in load_export(root).sightings}
+    assert by["joined"].intervals_ms == ((10, 20), (30, 40))
+    for sid in ("box_only", "broken", "plain"):
+        assert by[sid].intervals_ms == ((10, 40),), sid

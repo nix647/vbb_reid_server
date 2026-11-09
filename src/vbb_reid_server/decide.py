@@ -211,21 +211,23 @@ def _is_mixed(fs: FaceScores, sid: str, th: Thresholds, body_crops: list[np.ndar
 
 
 def _cannot_link(sightings: list[Sighting]) -> np.ndarray:
-    """Two sightings tracked on the same board at overlapping times are two people."""
+    """Two sightings tracked on the same board at overlapping times are two people.
+
+    "Tracked" means the tracks themselves: a joined sighting stands for several tracks, and the gaps
+    between them are not time it was tracked (the same person's unnamed track often sits in a gap)."""
     n = len(sightings)
     cl = np.zeros((n, n), dtype=bool)
     by_did: dict[str, list[int]] = {}
     for i, s in enumerate(sightings):
         by_did.setdefault(s.did, []).append(i)
     for idxs in by_did.values():
-        iv = sorted(idxs, key=lambda i: sightings[i].interval_ms[0])
-        for a_pos, a in enumerate(iv):
-            a0, a1 = sightings[a].interval_ms
-            for b in iv[a_pos + 1:]:
-                b0, _ = sightings[b].interval_ms
+        spans = sorted((start, end, i) for i in idxs for start, end in sightings[i].intervals_ms)
+        for pos, (_, a1, a) in enumerate(spans):
+            for b0, _, b in spans[pos + 1:]:
                 if b0 > a1:
                     break
-                cl[a, b] = cl[b, a] = True
+                if a != b:
+                    cl[a, b] = cl[b, a] = True
     return cl
 
 
