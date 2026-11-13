@@ -243,3 +243,15 @@ def test_the_csv_export_reads_the_reviewed_mark(tmp_path):
     # the mark is "<corrected_ts>:<state>:<person>" of the correction that set it (backend ReviewedMark);
     # it counts only while all three still match the row
     assert [r["sighting_id"] for r in rows if by[r["sighting_id"]].human_reviewed] == ["seen"]
+
+
+def test_the_rule_is_on_unless_a_replay_turns_it_off():
+    """Owner 2026-11-13: the job learns only from pictures someone looked at, by default. --no-label-check is the
+    comparison arm of a replay (learning from every renamed picture, as before 0.2.4)."""
+    from vbb_reid_server.cli import _vet, build_parser
+    p = build_parser()
+    for cmd, req in (("run", ["--backend", "x", "--token-file", "t", "--facility", "3", "--point", "p", "--emb", "m",
+                              "--cdn-cache", "c", "--out", "o"]),
+                     ("shadow", ["--export", "e", "--emb", "m", "--facility", "3", "--out", "o"])):
+        assert _vet(p.parse_args([cmd, *req])) == VetPolicy(), cmd
+        assert _vet(p.parse_args([cmd, *req, "--no-label-check"])) is None, cmd

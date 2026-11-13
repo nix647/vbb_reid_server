@@ -158,13 +158,13 @@ cd /home/dosomi/dev/vbb_reid_server
 
 A night that was drawn before a change to `refs.json` keeps the references it was drawn with. Answers live in `marks.json`, with one line per save in `marks.log`, next to each night's `frozen.json`.
 
-## Learning only from reviewed pictures (0.2.4, off until the owner's word)
+## Learning only from reviewed pictures (0.2.4; on by default since 0.2.5, owner 2026-11-13)
 
-`--label-check` on `run` or `shadow` makes the job learn only from staff labels on pictures someone looked at (plan decision 34, `vetting.py`). In the nightly job it is switched on with `VBB_RUN_LABEL_CHECK=1` on the crontab line (`scripts/nightly_run.sh` then adds `--label-check --verify-root $ROOT/verify`). Don't pass the options as extra arguments: an extra-argument run skips the night's check page, where the disagreements are reviewed. A picture counts if it carries the backend's `reviewed` mark, or if the owner answered it on the check page. `--verify-root` points at the check page's folder: `refs.json` and each finished night's answers settle the pictures they cover. A reviewed picture teaches the face only if it shows one clear face. Otherwise it only seeds that day's body match. Each run's JSON reports `label_check` counts (`reviewed`, `answered`, `not_reviewed`, `answer_disagrees`, and `no_face` / `two_faces` / `poor_face` for reviewed pictures without a clear face) and lists `disagreements`. `verify-build` adds all of them to the night's page (owner 2026-11-07: "show ALL disagreements, at least for now"); `--n-check` caps them.
+`run` and `shadow` learn only from renamed pictures someone looked at (plan decision 34, `vetting.py`). `--no-label-check` learns from every renamed picture, as before; it exists for the comparison arm of a replay. `scripts/nightly_run.sh` passes `--verify-root $ROOT/verify`, so the owner's check-page answers count too. A picture counts if it carries the backend's `reviewed` mark, or if the owner answered it on the check page. `--verify-root` points at the check page's folder: `refs.json` and each finished night's answers settle the pictures they cover. A reviewed picture teaches the face only if it shows one clear face. Otherwise it only seeds that day's body match. Each run's JSON reports `label_check` counts (`reviewed`, `answered`, `not_reviewed`, `answer_disagrees`, and `no_face` / `two_faces` / `poor_face` for reviewed pictures without a clear face) and lists `disagreements`. Since 0.2.5 they go to the correction list, not the check page (`verify-build --n-check` still adds them on request).
 
-Nothing is marked until the backend release with `reviewed_ids` is deployed and staff use an app build that sends it. Renames from before count as not reviewed. So the replay waits until staff at facility 3 have reviewed with the new app, on an export taken after that. The `reviewed` count in a run with the check on shows how many there are. If that count is missing or zero, the export carries no marks (too early, or its `extras` column is missing): stop, the comparison would show nothing. Use a cache built from the uploaded pictures, as the nightly job's own `emb` is. In a cache built with `--lan-crops` the board's crops replace the uploaded picture, which is the one staff looked at.
+Nothing is marked until the backend release with `reviewed_ids` is deployed and the app's users have a build that sends it. Renames from before count as not reviewed, so until then the job has little to learn from and names few people: expected under the owner's rule. The facility 3 replay compares both arms on an export taken after the app's users have reviewed with the new build. The `reviewed` count in a run with the check on shows how many there are. If that count is missing or zero, the export carries no marks (too early, or its `extras` column is missing): stop, the comparison would show nothing. Use a cache built from the uploaded pictures, as the nightly job's own `emb` is. In a cache built with `--lan-crops` the board's crops replace the uploaded picture, which is the one staff looked at.
 
-Replay before turning it on: the same shadow twice, once without and once with the check. Compare `references` per person in the two run JSONs, and score both labels files with `adjudicate-score` against the owner's answers:
+Replay: the same shadow twice, once with `--no-label-check` and once without. Compare `references` per person in the two run JSONs, and score both labels files with `adjudicate-score` against the owner's answers:
 
 ```bash
 cd /home/dosomi/dev/vbb_reid_server
@@ -172,7 +172,7 @@ for MODE in off on; do
   /home/dosomi/dev/ReID/.venv/bin/vbb-reid-server shadow --export <phase A export> --aliases <aliases.csv> \
     --emb <phase A emb root> --facility 3 --days <days> --point /vmdata/vbb_eval/models/point_3_clipreid_body.json \
     --face-model buffalo --body-model <CLIP-ReID cache slug> --roster-only-refs \
-    $([ $MODE = on ] && echo --label-check --verify-root /vmdata/vbb_eval/vbb_run/verify) --out <out>/$MODE
+    $([ $MODE = on ] && echo --verify-root /vmdata/vbb_eval/vbb_run/verify || echo --no-label-check) --out <out>/$MODE
 done
 ```
 

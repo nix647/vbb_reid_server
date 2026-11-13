@@ -33,21 +33,12 @@ if ! flock -n 9; then
   exit 75
 fi
 
-# Learn only from pictures someone looked at (plan decision 34): off unless VBB_RUN_LABEL_CHECK=1.
-# A setting, not an extra argument: an extra-argument run skips the verification page below, and the
-# disagreements this check finds are reviewed on that page.
-CHECK=()
-if [ "${VBB_RUN_LABEL_CHECK:-0}" = "1" ]; then
-  CHECK=(--label-check --verify-root "$ROOT/verify")
-fi
-
 LOG="$ROOT/logs/$(date +%Y%m%d-%H%M%S).log"
 cd "$CODE" || exit 1
 timeout --kill-after=5m "$MAX_TIME" "$VENV/bin/vbb-reid-server" run \
   --backend "$BACKEND" --token-file "$TOKEN_FILE" --facility "$FACILITY" --day auto \
   --point "$POINT" --models "$MODELS" \
-  --emb "$ROOT/emb" --cdn-cache "$ROOT/cdn" --out "$ROOT/runs" \
-  ${CHECK[@]+"${CHECK[@]}"} "$@" >> "$LOG" 2>&1
+  --emb "$ROOT/emb" --cdn-cache "$ROOT/cdn" --out "$ROOT/runs" --verify-root "$ROOT/verify" "$@" >> "$LOG" 2>&1
 rc=$?
 if [ "$rc" -ne 0 ]; then
   echo "$(date -Iseconds) rc=$rc log=$LOG" >> "$ROOT/FAILED"

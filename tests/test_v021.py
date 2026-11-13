@@ -258,7 +258,8 @@ def test_roster_only_shadow_keeps_alias_split_ids_apart_but_reports_alias_keys(t
     for i, pid in enumerate(["pX", "pX", "pY", "pY"]):
         sid = f"r{i}"
         rows.append({"sighting_id": sid, "facility_id": "3", "capture_ts": base + i, "identity_state": "uncertain",
-                     "corrected_state": "known", "corrected_person_id": pid, "corrected_at": "x", "corrected_ts": 1})
+                     "corrected_state": "known", "corrected_person_id": pid, "corrected_at": "x", "corrected_ts": 1,
+                     "extras": json.dumps({"reviewed": f"1:known:{pid}"})})  # looked at: learned from by default
         cache.append((sid, 0, np.eye(32, dtype=np.float32)[0], 0.9, 80.0))
     rows.append({"sighting_id": "q1", "facility_id": "3", "capture_ts": ms(2026, 10, 20, 9)})
     write_export(exp, rows, [("pX", "3", "visitor"), ("pY", "3", "visitor")])

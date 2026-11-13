@@ -571,8 +571,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="decide as production does: no alias file (ids folded through merges only) and only labels "
                          "of this facility's own roster; the labels file still reports alias keys for scoring")
     sp.add_argument("--setup")
-    sp.add_argument("--label-check", nargs="?", const="default",
-                    help="learn only from staff labels someone looked at (vetting.py); optional JSON of VetPolicy overrides")
+    sp.add_argument("--label-check", nargs="?", const="default", default="default",
+                    help="learn only from renamed pictures someone looked at (vetting.py, owner 2026-11-11/12): on by "
+                         "default; optional JSON of VetPolicy overrides")
+    sp.add_argument("--no-label-check", dest="label_check", action="store_const", const=None,
+                    help="learn from every renamed picture, as before 0.2.4 (the comparison arm of a replay)")
     sp.add_argument("--verify-root", help="check page root: refs.json and each finished night's answers settle the "
                                           "pictures they cover")
     sp.add_argument("--out", required=True)
@@ -602,8 +605,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="guard: promotions / sightings above this are reported as a guard failure (the worker never "
                          "activates; activation is on the app host)")
     sp.add_argument("--keep-crops", action="store_true", help="keep the downloaded crops (debugging)")
-    sp.add_argument("--label-check", nargs="?", const="default",
-                    help="learn only from staff labels someone looked at (vetting.py); optional JSON of VetPolicy overrides")
+    sp.add_argument("--label-check", nargs="?", const="default", default="default",
+                    help="learn only from renamed pictures someone looked at (vetting.py, owner 2026-11-11/12): on by "
+                         "default; optional JSON of VetPolicy overrides")
+    sp.add_argument("--no-label-check", dest="label_check", action="store_const", const=None,
+                    help="learn from every renamed picture, as before 0.2.4 (the comparison arm of a replay)")
     sp.add_argument("--verify-root", help="check page root: refs.json and each finished night's answers settle the "
                                           "pictures they cover")
     sp.set_defaults(fn=cmd_run)
