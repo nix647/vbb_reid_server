@@ -157,12 +157,23 @@ def test_disagreements_reach_the_page_blind_and_are_scored_apart(tmp_path):
     meta = json.loads(next(runs.glob("run_*.json")).read_text())
     assert meta["label_check"]["counts"]["not_reviewed"] == 4 and len(meta["disagreements"]) == 2
     with next(runs.glob("labels_*.csv")).open() as fh:
-        row = {r["sighting_id"]: r for r in csv.DictReader(fh)}["q0"]
-    assert (row["human_state"], row["human_person_id"], row["label_check"]) == ("known", "pA", "not_reviewed")
+        labels = {r["sighting_id"]: r for r in csv.DictReader(fh)}
+    row = labels["q0"]
+    assert (row["human_state"], row["human_person_id"], row["label_check"], row["human_reviewed"]) == (
+        "known", "pA", "not_reviewed", "0")
+    assert labels["a0"]["human_reviewed"] == "1"
+    # every staff label the run saw, with its mark: the correction list re-checks older pictures against it
+    with next(runs.glob("staff_*.csv")).open() as fh:
+        staff = {r["sighting_id"]: r for r in csv.DictReader(fh)}
+    assert set(staff) == {s.sighting_id for s in ws.export.sightings if s.human_state}  # u0-u2 too: never named
+    assert {"u0", "u1", "u2"} <= set(staff) - set(labels)
+    assert (staff["a0"]["human_reviewed"], staff["q0"]["human_reviewed"], staff["s0"]["human_state"]) == ("1", "0", "stranger")
     refs = tmp_path / "refs.json"
     refs.write_text(json.dumps({"people": [{"key": "pA", "person_id": "pA", "photos": [{"url": IMAGE_PREFIX + "r"}]},
                                            {"key": "pB", "person_id": "pB", "photos": [{"url": IMAGE_PREFIX + "r"}]}]}))
-    fz = json.loads(build_night(runs, refs, tmp_path / "verify", "3", DAY).read_text())
+    plain = json.loads(build_night(runs, refs, tmp_path / "plain", "3", DAY).read_text())
+    assert [it["kind"] for it in plain["items"]].count("check") == 0  # by default they go to the correction list
+    fz = json.loads(build_night(runs, refs, tmp_path / "verify", "3", DAY, n_check=None).read_text())
     checks = [i for i, it in enumerate(fz["items"]) if it["kind"] == "check"]
     assert fz["disagreements"] == 2 and len(checks) == 2
     assert "kind" not in json.dumps(page_data(fz)) and "staff" not in json.dumps(page_data(fz))
@@ -189,7 +200,7 @@ def test_disagreements_are_mixed_into_the_sample(tmp_path):
                                                                  "disagreements": dis}))
     refs = tmp_path / "refs.json"
     refs.write_text(json.dumps({"people": []}))
-    fz = json.loads(build_night(runs, refs, tmp_path / "verify", "3", DAY).read_text())
+    fz = json.loads(build_night(runs, refs, tmp_path / "verify", "3", DAY, n_check=None).read_text())
     kinds = [it["kind"] for it in fz["items"]]
     assert kinds.count("sample") == 20 and kinds.count("check") == 40 and fz["disagreements"] == 40  # all of them, past any old cap of 30
     capped = json.loads(build_night(runs, refs, tmp_path / "v2", "3", DAY, n_check=5).read_text())

@@ -61,5 +61,14 @@ if [ "$rc" -eq 0 ] && [ "$#" -eq 0 ] && [ -f "$REFS" ]; then
     --facility "$FACILITY" --day auto >> "$LOG" 2>&1 \
     || echo "$(date -Iseconds) verify-build failed log=$LOG" >> "$ROOT/FAILED"
 fi
+
+# Correction list (owner 2026-11-13, corrections.py): tonight's pictures the machine names differently from a name
+# nobody confirmed. After the check page, so tonight's sample stays off the list until it's answered; when the
+# check page is in use and wasn't drawn, the list waits for it. Same skips as the check page, same failure record.
+if [ "$rc" -eq 0 ] && [ "$#" -eq 0 ]; then
+  "$VENV/bin/vbb-reid-server" corrections --runs "$ROOT/runs" --verify-root "$ROOT/verify" \
+    --facility "$FACILITY" --day auto >> "$LOG" 2>&1 \
+    || echo "$(date -Iseconds) corrections failed log=$LOG" >> "$ROOT/FAILED"
+fi
 find "$ROOT/logs" -name '*.log' -mtime +30 -delete
 exit "$rc"

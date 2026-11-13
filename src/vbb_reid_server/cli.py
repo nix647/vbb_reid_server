@@ -406,6 +406,12 @@ def cmd_verify_build(args) -> None:
                     n_check=args.n_check, run_id=args.run_id)
 
 
+def cmd_corrections(args) -> None:
+    from .corrections import update_list
+    for day in _run_days(args):
+        update_list(Path(args.runs), Path(args.verify_root), str(args.facility), day)
+
+
 def cmd_verify_serve(args) -> None:
     from .verify import serve
     serve(Path(args.root), args.port)
@@ -678,9 +684,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--day", default="auto", help="auto (yesterday, facility time), YYYY-MM-DD, or A..B")
     sp.add_argument("--tz", default="Asia/Shanghai")
     sp.add_argument("--n", type=int, default=20)
-    sp.add_argument("--n-check", type=int, help="most disagreement pictures added to the night (default: all)")
+    sp.add_argument("--n-check", type=int, default=0,
+                    help="disagreement pictures added to the night (default 0: they go to the correction list)")
     sp.add_argument("--run-id", help="this run instead of the newest non-dry one (one day only)")
     sp.set_defaults(fn=cmd_verify_build)
+
+    sp = sub.add_parser("corrections", help="add a night to the correction list (nightly, after verify-build)")
+    sp.add_argument("--runs", required=True, help="the run's --out folder")
+    sp.add_argument("--verify-root", required=True, help="verification root; the list is <root>/corrections/list.json")
+    sp.add_argument("--facility", required=True)
+    sp.add_argument("--day", default="auto", help="auto (yesterday, facility time), YYYY-MM-DD, or A..B")
+    sp.add_argument("--tz", default="Asia/Shanghai")
+    sp.set_defaults(fn=cmd_corrections)
 
     sp = sub.add_parser("verify-serve", help="the verification page on 127.0.0.1, for an ssh tunnel")
     sp.add_argument("--root", required=True, help="verification root")

@@ -34,7 +34,11 @@ LABEL_FIELDS = ["run_id", "sighting_id", "facility_id", "day", "did", "room_id",
                 "board_person_id", "state", "relation", "person_id", "person_key", "via", "confidence",
                 "margin", "face_sim", "body_sim", "human_labeled", "evidence",
                 "image_url",  # the verification page shows this picture (added 0.2.3)
-                "human_state", "human_person_id", "label_check"]  # the staff label and its check (0.2.4)
+                "human_state", "human_person_id", "label_check",  # the staff label and its check (0.2.4)
+                "human_reviewed"]  # someone looked at that staff label (backend reviewed mark, 0.2.4)
+# Every staff label the run saw (probe-day overlays and the references of the window), with its reviewed mark:
+# the correction list re-checks older pictures against the latest one (corrections.py).
+STAFF_FIELDS = ["sighting_id", "facility_id", "day", "human_state", "human_person_id", "human_reviewed"]
 
 
 def decide_night(ws: Workspace, facility: str, day: str, th: Thresholds, policy: RefPolicy,
@@ -133,7 +137,16 @@ def shadow_run(ws: Workspace, facility: str, day: str, th: Thresholds, out_dir: 
                 "image_url": s.image_url or "",
                 "human_state": s.human_state or "", "human_person_id": s.human_person_id or "",
                 "label_check": vetting.status.get(l.sighting_id, "") if vetting is not None else "",
+                "human_reviewed": int(s.human_reviewed),
             })
+    with (out / f"staff_{facility}_{day}_{run_id[:8]}.csv").open("w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=STAFF_FIELDS)
+        w.writeheader()
+        for s in ex.sightings:
+            if s.human_state is not None:
+                w.writerow({"sighting_id": s.sighting_id, "facility_id": s.facility_id, "day": s.day,
+                            "human_state": s.human_state, "human_person_id": s.human_person_id or "",
+                            "human_reviewed": int(s.human_reviewed)})
     run = {
         "run_id": run_id, "facility_id": facility, "day": day, "model": model_name,
         "face_model_id": ws.face_id, "body_model_id": ws.body_id, "thresholds": th.as_dict(),

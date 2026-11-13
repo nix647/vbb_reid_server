@@ -182,6 +182,19 @@ It fails if either of these holds with the check on:
 
 Either result goes to the owner before the nightly changes. People with no reviewed pictures yet simply aren't named; that is expected and not a failure. Scoring against answers that also settle labels is fair only for pictures that weren't themselves staff labels, and `adjudicate-score` counts only those.
 
+## Correction list (0.2.5)
+
+Owner 2026-11-13 (plan decision 35): one list that grows night by night, separate from the check page. `scripts/nightly_run.sh` runs `corrections` after `verify-build`, same skips. It writes `<root>/verify/corrections/list.json`, keyed by sighting id. A picture joins when the machine disagrees with a name nobody confirmed (the board's, or a staff name nobody looked at), and leaves once a person confirms it. The rules are at the top of `corrections.py`. Nothing shows the list yet; how reviewers work through it is a follow-up. The file holds the uploaded picture's link, so it stays on the box like the check page's files.
+
+To look at it on the box:
+
+```bash
+cd /vmdata/vbb_eval/vbb_run/verify/corrections
+python3 -c 'import json,collections; d=json.load(open("list.json")); i=d["items"].values(); print(collections.Counter(x["status"] for x in i), collections.Counter(x.get("closed_reason") for x in i if x["status"]=="closed"), len(d["held"]), "waiting")'
+```
+
+It fails if the night's log has no `[corrections]` line, or if `$ROOT/FAILED` gains a `corrections failed` line. When the check page is in use and tonight's wasn't drawn, the log says the list waits; that is not a failure.
+
 ## Known gaps
 
 - `vbb_contracts` is not merged: `machine_labels.md` is on its `claude/wonderful-hawking-vpm3va` branch, and it belongs to someone else.

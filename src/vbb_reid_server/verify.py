@@ -117,10 +117,11 @@ def _night_run(runs_dir: Path, facility: str, day: str, run_id: str | None):
 
 
 def build_night(runs_dir: Path, refs_path: Path, out_root: Path, facility: str, day: str, *, n: int = 20,
-                n_check: int | None = None, run_id: str | None = None, log=print) -> Path | None:
-    """``n`` sample items (the machine's new names) plus every disagreement item (or at most ``n_check``) (a staff label
-    the machine named someone else for, from the run JSON's ``disagreements``), shuffled together so the
-    reviewer can't tell which is which. Disagreements are scored apart from the sample."""
+                n_check: int | None = 0, run_id: str | None = None, log=print) -> Path | None:
+    """``n`` sample items (the machine's new names). Disagreement items (a staff label the machine named someone
+    else for, from the run JSON's ``disagreements``) are added only when asked: at most ``n_check``, ``None`` = all,
+    shuffled in so the reviewer can't tell which is which, and scored apart from the sample. By default there are
+    none: the check page measures, and those pictures go to the correction list (owner 2026-11-13, corrections.py)."""
     night = out_root / f"{facility}_{day}"
     frozen = night / "frozen.json"
     if frozen.exists():
