@@ -158,6 +158,30 @@ cd /home/dosomi/dev/vbb_reid_server
 
 A night that was drawn before a change to `refs.json` keeps the references it was drawn with. Answers live in `marks.json`, with one line per save in `marks.log`, next to each night's `frozen.json`.
 
+## Learning only from reviewed pictures (0.2.4, off until the owner's word)
+
+`--label-check` on `run` or `shadow` makes the job learn only from staff labels on pictures someone looked at (plan decision 34, `vetting.py`). In the nightly job it is switched on with `VBB_RUN_LABEL_CHECK=1` on the crontab line (`scripts/nightly_run.sh` then adds `--label-check --verify-root $ROOT/verify`). Don't pass the options as extra arguments: an extra-argument run skips the night's check page, where the disagreements are reviewed. A picture counts if it carries the backend's `reviewed` mark, or if the owner answered it on the check page. `--verify-root` points at the check page's folder: `refs.json` and each finished night's answers settle the pictures they cover. A reviewed picture teaches the face only if it shows one clear face. Otherwise it only seeds that day's body match. Each run's JSON reports `label_check` counts (`reviewed`, `answered`, `not_reviewed`, `answer_disagrees`, and `no_face` / `two_faces` / `poor_face` for reviewed pictures without a clear face) and lists `disagreements`. `verify-build` adds all of them to the night's page (owner 2026-11-07: "show ALL disagreements, at least for now"); `--n-check` caps them.
+
+Nothing is marked until the backend release with `reviewed_ids` is deployed and staff use an app build that sends it. Renames from before count as not reviewed. So the replay waits until staff at facility 3 have reviewed with the new app, on an export taken after that. The `reviewed` count in a run with the check on shows how many there are. If that count is missing or zero, the export carries no marks (too early, or its `extras` column is missing): stop, the comparison would show nothing. Use a cache built from the uploaded pictures, as the nightly job's own `emb` is. In a cache built with `--lan-crops` the board's crops replace the uploaded picture, which is the one staff looked at.
+
+Replay before turning it on: the same shadow twice, once without and once with the check. Compare `references` per person in the two run JSONs, and score both labels files with `adjudicate-score` against the owner's answers:
+
+```bash
+cd /home/dosomi/dev/vbb_reid_server
+for MODE in off on; do
+  /home/dosomi/dev/ReID/.venv/bin/vbb-reid-server shadow --export <phase A export> --aliases <aliases.csv> \
+    --emb <phase A emb root> --facility 3 --days <days> --point /vmdata/vbb_eval/models/point_3_clipreid_body.json \
+    --face-model buffalo --body-model <CLIP-ReID cache slug> --roster-only-refs \
+    $([ $MODE = on ] && echo --label-check --verify-root /vmdata/vbb_eval/vbb_run/verify) --out <out>/$MODE
+done
+```
+
+It fails if either of these holds with the check on:
+- precision on the answered pictures is lower;
+- the labels file names someone who has fewer than `min_refs` (3) face references in the run JSON's `references`.
+
+Either result goes to the owner before the nightly changes. People with no reviewed pictures yet simply aren't named; that is expected and not a failure. Scoring against answers that also settle labels is fair only for pictures that weren't themselves staff labels, and `adjudicate-score` counts only those.
+
 ## Known gaps
 
 - `vbb_contracts` is not merged: `machine_labels.md` is on its `claude/wonderful-hawking-vpm3va` branch, and it belongs to someone else.

@@ -208,10 +208,10 @@ def export_from_backend(client: BackendClient, facility_id: int, day: str, *, wi
     """One facility-day as an ``Export``: the day's sightings (probes) and the references.
 
     - Probes: board prediction as reported; ``human_labeled`` rows keep their overlay kind
-      (``human_state``), so they are decided but never pushed.
+      (``human_state``) and the backend's ``human_reviewed`` mark, so they are decided but never pushed.
     - References: human ``known`` labels (already scoped by the backend to this facility's roster,
       person ids folded), on sightings captured since ``day - window_days``; a same-day label lands
-      on its probe row.
+      on its probe row. Each carries the backend's ``reviewed`` mark (someone looked at that picture).
     - Roster: this facility's registered ids.
     """
     fac = str(facility_id)
@@ -244,7 +244,9 @@ def export_from_backend(client: BackendClient, facility_id: int, day: str, *, wi
             image_url=_s(r.get("image_url")), capture_ts=int(r["capture_ts"]),
             track_started_ts=r.get("track_started_ts"), track_ended_ts=r.get("track_ended_ts"),
             human_state=hs, human_person_id=None, corrected_ts=None, day=day,
-            joined_spans_ms=joined_spans(r.get("joined_tracks")))
+            joined_spans_ms=joined_spans(r.get("joined_tracks")),
+            # someone looked at this overlay (stranger and can't-tell labels never come through references/pull)
+            human_reviewed=hs is not None and bool(r.get("human_reviewed")))
 
     for r in refs:
         sid = str(r["sighting_id"])
@@ -252,7 +254,7 @@ def export_from_backend(client: BackendClient, facility_id: int, day: str, *, wi
         cap = int(r["capture_ts"])
         if sid in sightings and rfac == fac:
             sightings[sid] = replace(sightings[sid], human_state="known", human_person_id=str(r["person_id"]),
-                                     corrected_ts=int(r["corrected_ts"]))
+                                     corrected_ts=int(r["corrected_ts"]), human_reviewed=bool(r.get("reviewed")))
             continue
         sightings[sid] = Sighting(
             sighting_id=sid, did=str(r.get("did") or ""), room_id="", facility_id=rfac, track_id=None,
@@ -260,7 +262,7 @@ def export_from_backend(client: BackendClient, facility_id: int, day: str, *, wi
             crop_quality=None, crop_is_face=bool(r.get("crop_is_face")), crop_count=1,
             image_url=_s(r.get("image_url")), capture_ts=cap, track_started_ts=None, track_ended_ts=None,
             human_state="known", human_person_id=str(r["person_id"]), corrected_ts=int(r["corrected_ts"]),
-            day=str(r.get("day") or local_day(cap, tz)))
+            day=str(r.get("day") or local_day(cap, tz)), human_reviewed=bool(r.get("reviewed")))
 
     people = {str(p["person_id"]): Person(person_id=str(p["person_id"]), facility_id=fac,
                                           person_type=_s(p.get("person_type")), role=_s(p.get("role")),

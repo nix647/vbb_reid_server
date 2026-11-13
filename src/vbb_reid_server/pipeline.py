@@ -106,6 +106,7 @@ class Workspace:
                    policy: RefPolicy = RefPolicy(), exclude_keys: set[str] | None = None,
                    exclude_days: set[str] | None = None, allow_after: bool = False,
                    label_filter: Callable[[Sighting], bool] | None = None,
+                   crop_filter: Callable[[FaceTable, int], bool] | None = None,
                    roster_ids: set[str] | None = None) -> Refs:
         """Face reference vectors per identity key.
 
@@ -114,6 +115,8 @@ class Workspace:
           within ``window_days``; ``allow_after`` lifts the upper bound (leave-one-day-out).
         - ``exclude_keys``: people removed (leave-one-person-out). ``exclude_days``: days removed.
         - ``policy.roster_only``: only labels whose folded person is in ``roster_ids`` (required then).
+        - ``label_filter`` / ``crop_filter``: only these labels, and of their crops only these (the label
+          check, ``vetting``: a sighting can have several crops and not all of them show one clear face).
         """
         if policy.roster_only and roster_ids is None:
             raise ValueError("RefPolicy.roster_only needs roster_ids (the probe facility's registered ids)")
@@ -150,7 +153,7 @@ class Workspace:
                 pos.setdefault(str(sid), []).append(i)
             for s in ss:
                 for i in pos.get(s.sighting_id, []):
-                    if ref_usable(ft, i, policy):
+                    if ref_usable(ft, i, policy) and (crop_filter is None or crop_filter(ft, i)):
                         rows.setdefault(self.export.key(s.human_person_id), []).append(
                             (s.capture_ts, s.sighting_id, ft.vec[i]))
         vecs: dict[str, np.ndarray] = {}

@@ -138,7 +138,7 @@ def test_production_run_files_carry_the_picture_and_the_dry_run_marker(tmp_path)
     assert run["dry_run"] is False
     assert json.loads(next((tmp_path / "out").glob("run_*.json")).read_text())["dry_run"] is False
     with next((tmp_path / "out").glob("labels_*.csv")).open(encoding="utf-8") as fh:
-        assert next(csv.reader(fh))[-1] == "image_url"
+        assert next(csv.reader(fh))[-4:] == ["image_url", "human_state", "human_person_id", "label_check"]
 
 
 # --- page and server ----------------------------------------------------------------------

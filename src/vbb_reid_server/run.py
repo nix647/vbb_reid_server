@@ -17,6 +17,9 @@ Rules this module owns:
 - The worker never activates. Activation lives on the app host (owner 2026-11-05: manual through the
   trial, automatic with guards after the Phase B gate); the guards are computed here and reported in
   the run's ``counts`` (``guard_failures``) for that step to read.
+- With ``vet`` given, staff labels are learned from only where someone looked at the picture
+  (``vetting``, owner 2026-11-11/12); your check-page answers under ``verify_root`` settle the
+  pictures they cover. Off unless asked.
 - Relabels are flags in v1 whatever the operating point says (``allow_relabel`` forced off).
 - Embedding: only what the cache lacks, face only for references (their body vectors are never read),
   never days after the probe day.
@@ -41,6 +44,7 @@ from .decide import MachineLabel, Thresholds
 from .pipeline import RefPolicy, Workspace
 from .quality import QualityPolicy
 from .shadow import decide_night, shadow_run
+from .vetting import load_trusted
 
 
 @dataclass(frozen=True)
@@ -154,7 +158,7 @@ def run_night(client: BackendClient, facility_id: int, day: str, *, th: Threshol
               policy: RefPolicy, emb_root: str | Path, out_dir: str | Path, models=None,
               face_id: str | None = None, body_id: str | None = None, store=None,
               tz_name: str = "Asia/Shanghai", dry_run: bool = False, guards: Guards = Guards(),
-              keep_crops: bool = False, worker_id: str | None = None,
+              keep_crops: bool = False, worker_id: str | None = None, vet=None, verify_root=None,
               now_ms=lambda: int(time.time() * 1000), log=print) -> dict:
     """``models``: a loaded model set (embeds what the cache lacks); ``None`` = use the cache only,
     with ``face_id`` / ``body_id`` naming the cached models (tests, re-runs)."""
@@ -169,7 +173,8 @@ def run_night(client: BackendClient, facility_id: int, day: str, *, th: Threshol
     started = now_ms()
     model_id = model_id_of(face_id, body_id)
     worker_id = worker_id or socket.gethostname()[:64]
-    thresholds = _clean({**th.as_dict(), "ref_policy": asdict(policy), "quality": asdict(quality)})
+    thresholds = _clean({**th.as_dict(), "ref_policy": asdict(policy), "quality": asdict(quality),
+                         **({"label_check": asdict(vet)} if vet is not None else {})})
     attempted = False
     summary: dict = {"run_id": run_id, "facility_id": fac, "day": day, "dry_run": dry_run, "model_id": model_id}
     try:
@@ -181,10 +186,11 @@ def run_night(client: BackendClient, facility_id: int, day: str, *, th: Threshol
         if models is not None:
             counts.update(embed_missing(ex, fac, day, models, store, emb_root, log=log))
         ws = Workspace(ex, emb_root, face_id, body_id, quality)
-        decided = decide_night(ws, fac, day, th, policy, label_cutoff_ms=started)
+        trusted = load_trusted(verify_root) if vet is not None else None
+        decided = decide_night(ws, fac, day, th, policy, label_cutoff_ms=started, vet=vet, trusted=trusted)
         local = shadow_run(ws, fac, day, th, out_dir, policy=policy, label_cutoff_ms=started,
                            model_name=model_id, run_id=run_id, decided=decided,
-                           extra={"dry_run": dry_run}, log=log)
+                           extra={"dry_run": dry_run}, vet=vet, log=log)
         by_sid = {s.sighting_id: s for s in decided["sightings"]}
         keep = [l for l in decided["labels"] if not by_sid[l.sighting_id].has_overlay]
         rows = [label_row(l) for l in keep]
@@ -194,6 +200,10 @@ def run_night(client: BackendClient, facility_id: int, day: str, *, th: Threshol
                 and (l.person_key not in refs or refs.n_sightings(l.person_key) < th.min_refs)}
         counts.update(labels=len(rows), references=sum(refs.n_sightings(k) for k in refs),
                       references_people=len(refs))
+        if decided.get("vetting") is not None:
+            for st, n in decided["vetting"].counts().items():
+                counts[f"label_check_{st}"] = n
+            counts["disagreements"] = len(local.get("disagreements") or [])
         for r in rows:
             k = f"pushed_{r['relation']}"
             counts[k] = counts.get(k, 0) + 1

@@ -117,7 +117,10 @@ def _night_run(runs_dir: Path, facility: str, day: str, run_id: str | None):
 
 
 def build_night(runs_dir: Path, refs_path: Path, out_root: Path, facility: str, day: str, *, n: int = 20,
-                run_id: str | None = None, log=print) -> Path | None:
+                n_check: int | None = None, run_id: str | None = None, log=print) -> Path | None:
+    """``n`` sample items (the machine's new names) plus every disagreement item (or at most ``n_check``) (a staff label
+    the machine named someone else for, from the run JSON's ``disagreements``), shuffled together so the
+    reviewer can't tell which is which. Disagreements are scored apart from the sample."""
     night = out_root / f"{facility}_{day}"
     frozen = night / "frozen.json"
     if frozen.exists():
@@ -141,20 +144,32 @@ def build_night(runs_dir: Path, refs_path: Path, out_root: Path, facility: str, 
             counts[f"{r['state']}/{r['relation']}/{r['via']}"] += 1
     rng = random.Random(f"verify:{facility}:{day}:{meta['run_id']}")
     drawn = rng.sample(pool, min(n, len(pool)))
+    items = [{"kind": "sample", "sighting_id": r["sighting_id"], "url": r["image_url"], "person_id": r["person_id"],
+              "via": r["via"], "face_sim": r["face_sim"], "body_sim": r["body_sim"]} for r in drawn]
+    sample_ids = {it["sighting_id"] for it in items}
+    checks = sorted((d for d in meta.get("disagreements") or []
+                     if (d.get("url") or "").startswith(IMAGE_PREFIX) and d["sighting_id"] not in sample_ids),
+                    key=lambda d: d["sighting_id"])
+    picked = checks if n_check is None else rng.sample(checks, min(n_check, len(checks)))
+    items += [{"kind": "check", "sighting_id": d["sighting_id"], "url": d["url"], "person_id": d["machine"],
+               "staff": d.get("staff"), "check": d.get("check", ""), "via": d.get("via", ""),
+               "face_sim": "", "body_sim": ""} for d in picked]
+    if picked:
+        rng.shuffle(items)
     refs = json.loads(Path(refs_path).read_text(encoding="utf-8"))
     data = {
         "facility_id": facility, "day": day, "run_id": meta["run_id"], "model": meta.get("model", ""),
         "drawn_at": int(time.time()), "n": n, "pool": len(pool), "pool_by_via": _by(pool, "via"),
         "counts": dict(sorted(counts.items())), "refs_built_at": refs.get("built_at"), "people": refs["people"],
-        "items": [{"sighting_id": r["sighting_id"], "url": r["image_url"], "person_id": r["person_id"],
-                   "via": r["via"], "face_sim": r["face_sim"], "body_sim": r["body_sim"]} for r in drawn],
+        "disagreements": len(checks), "items": items,
     }
     night.mkdir(parents=True, exist_ok=True)
     tmp = night / "frozen.json.tmp"
     tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, frozen)
     os.chmod(frozen, 0o444)
-    log(f"[verify] {night.name}: drew {len(drawn)} of {len(pool)} new names (run {meta['run_id'][:8]})")
+    log(f"[verify] {night.name}: drew {len(drawn)} of {len(pool)} new names and {len(picked)} of {len(checks)} "
+        f"disagreements (run {meta['run_id'][:8]})")
     return frozen
 
 
@@ -167,16 +182,28 @@ def _by(rows, field) -> dict[str, int]:
 
 # ------------------------------------------------------------------------ scoring --
 def score_night(frozen: dict, marks: dict) -> dict:
-    """right: the answer is the machine's person; wrong: another person, or someone not on the list;
-    can't tell is left out of precision."""
+    """Sample items: right = the answer is the machine's person; wrong = another person, or someone not on the
+    list; can't tell is left out of precision. Disagreement items (``kind == "check"``) never count toward
+    precision: they are tallied in ``checks`` by who the answer sides with."""
     by_key = {p["key"]: p["person_id"] for p in frozen["people"]}
     t = {"right": 0, "wrong": 0, "cant_tell": 0, "unanswered": 0}
     per_via: dict[str, list[int]] = defaultdict(lambda: [0, 0])
     per_person: dict[str, list[int]] = defaultdict(lambda: [0, 0])
     wrong = []
     answers = marks.get("answers") or {}
+    checks = {"staff": 0, "machine": 0, "neither": 0, "cant_tell": 0, "unanswered": 0}
+    check_items = []
     for i, it in enumerate(frozen["items"]):
         a = answers.get(str(i))
+        if it.get("kind") == "check":
+            side = ("unanswered" if a is None else "cant_tell" if a == CANT
+                    else "machine" if by_key.get(a) == it["person_id"]
+                    else "staff" if it.get("staff") is not None and by_key.get(a) == it["staff"] else "neither")
+            checks[side] += 1
+            if side not in ("unanswered", "cant_tell"):
+                check_items.append({"i": i, "answer": a, "side": side, "machine": it["person_id"],
+                                    "staff": it.get("staff"), "check": it.get("check", "")})
+            continue
         if a is None:
             t["unanswered"] += 1
             continue
@@ -190,7 +217,8 @@ def score_night(frozen: dict, marks: dict) -> dict:
         if not ok:
             wrong.append({"i": i, "answer": a, "machine": it["person_id"], "via": it["via"],
                           "face_sim": it["face_sim"], "body_sim": it["body_sim"]})
-    return {**t, "per_via": dict(per_via), "per_person": dict(per_person), "wrong_items": wrong}
+    return {**t, "per_via": dict(per_via), "per_person": dict(per_person), "wrong_items": wrong,
+            "checks": checks, "check_items": check_items}
 
 
 # ------------------------------------------------------------------------ server --
@@ -372,6 +400,7 @@ def _pct(x):
 def index_html(store: Store) -> str:
     e = html.escape
     rows, tot_via, tot_person, wrong_rows = [], defaultdict(lambda: [0, 0]), defaultdict(lambda: [0, 0]), []
+    check_rows = []
     names = {}
     for night in store.nights():
         fz, mk = store.frozen(night), store.marks(night)
@@ -381,8 +410,12 @@ def index_html(store: Store) -> str:
         state = "done" if done else (f"{len(mk.get('answers') or {})} of {len(fz['items'])} answered" if mk.get("answers") else "not started")
         res = (f"<span class=ok>{sc['right']} right</span> · <span class=bad>{sc['wrong']} wrong</span> · "
                f"{sc['cant_tell']} can't tell") if sc else "<span class=muted>shown when done</span>"
+        if sc and any(sc["checks"].values()):
+            c = sc["checks"]
+            res += (f"<br><span class=muted>disagreements: staff {c['staff']} · machine {c['machine']} · "
+                    f"neither {c['neither']} · can't tell {c['cant_tell']}</span>")
         rows.append(f"<tr><td><a href='/n/{e(night)}'>{e(fz['day'])}</a></td><td>{fz['pool']}</td>"
-                    f"<td>{len(fz['items'])}</td><td>{e(state)}</td><td>{res}</td>"
+                    f"<td>{sum(1 for it in fz['items'] if it.get('kind') != 'check')}</td><td>{e(state)}</td><td>{res}</td>"
                     f"<td class=muted>{e(mk.get('reviewer') or '')}</td></tr>")
         if sc:
             for v, (r, w) in sc["per_via"].items():
@@ -393,6 +426,8 @@ def index_html(store: Store) -> str:
                 tot_person[p][1] += w
             for x in sc["wrong_items"]:
                 wrong_rows.append((night, fz["day"], x))
+            for x in sc["check_items"]:
+                check_rows.append((night, fz["day"], x))
 
     def tally(d, label):
         out = []
@@ -408,15 +443,27 @@ def index_html(store: Store) -> str:
         f"<td>machine: {e(names.get(x['machine'], x['machine'][-6:]))}<br>answer: {e(x['answer'])}</td>"
         f"<td class=muted>{e(x['via'])} face {e(str(x['face_sim']))} body {e(str(x['body_sim']))}</td></tr>"
         for night, day, x in wrong_rows) or "<tr><td class=muted>none</td></tr>"
+    def who(pid):
+        return "stranger" if pid is None else names.get(pid, pid[-6:])
+    check_html = "".join(
+        f"<tr><td>{e(day)}</td><td><img src='/img/{e(night)}/{x['i']}' style='height:120px'></td>"
+        f"<td>staff: {e(who(x['staff']))}<br>machine: {e(who(x['machine']))}<br>answer: {e(x['answer'])}</td>"
+        f"<td class={'ok' if x['side'] == 'machine' else 'bad' if x['side'] == 'staff' else 'muted'}>"
+        f"{e(x['side'])} right</td></tr>"
+        for night, day, x in check_rows) or "<tr><td class=muted>none</td></tr>"
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Nightly name check</title>{_STYLE}</head>
 <body><main><h2>Nightly name check</h2>
-<p class=muted>Each night, a random sample of the new names the machine gave (labels are still hidden in the app).
+<p class=muted>Each night, a random sample of the new names the machine gave (labels are still hidden in the app),
+mixed with pictures where the machine and a staff label disagree.
 Open a night, say who each picture shows, then press "I'm done". Results appear only after that.</p>
 <table><tr><th>night</th><th>new names</th><th>sample</th><th>status</th><th>result</th><th>reviewer</th></tr>{''.join(rows)}</table>
 <h3>All finished nights, by how the name was made</h3><table>{head.format('via')}{tally(tot_via, lambda k: k)}</table>
 <h3>By the person the machine named</h3><table>{head.format('person')}{tally(tot_person, lambda k: names.get(k, k[-6:]))}</table>
 <h3>Wrong names</h3><table>{wrong_html}</table>
+<h3>Disagreements decided</h3>
+<p class=muted>Pictures where the machine named someone other than the staff label. Your answer is final: a staff
+label you overruled is never learned from again. It does not change the name in the app.</p><table>{check_html}</table>
 <p class=muted>"At least" is the one-sided 97.5 % lower bound: with 0 wrong it reaches 98 % only after 183 answers.</p>
 </main></body></html>"""
 

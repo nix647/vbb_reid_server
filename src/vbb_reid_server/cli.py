@@ -215,9 +215,24 @@ def cmd_shadow(args) -> None:
     ws = Workspace(ex, args.emb, face_id, body_id, quality)
     days = args.days.split(",") if args.days else ex.days(args.facility)
     cutoff = "run" if args.labels_until == "run" else None
+    vet = _vet(args)
+    trusted = None
+    if vet is not None:
+        from .vetting import load_trusted
+        trusted = load_trusted(args.verify_root)
     for day in days:
         shadow_run(ws, args.facility, day, th, args.out, policy=policy, label_cutoff_ms=cutoff,
-                   model_name=args.setup or "", report_key=report_key)
+                   model_name=args.setup or "", report_key=report_key, vet=vet, trusted=trusted)
+
+
+def _vet(args):
+    """--label-check [JSON overrides] -> VetPolicy, or None when not asked."""
+    if getattr(args, "label_check", None) is None:
+        return None
+    from .vetting import VetPolicy
+    if args.label_check == "default":
+        return VetPolicy()
+    return strict_replace(VetPolicy(), json.loads(Path(args.label_check).read_text(encoding="utf-8")), "VetPolicy")
 
 
 def _point(path: str) -> tuple[Thresholds, QualityPolicy, RefPolicy]:
@@ -278,7 +293,8 @@ def cmd_run(args) -> None:
         try:
             run_night(client, int(args.facility), day, th=th, quality=quality, policy=policy, emb_root=args.emb,
                       out_dir=args.out, models=models, face_id=face_id, body_id=body_id, store=store,
-                      tz_name=args.tz, dry_run=args.dry_run, guards=Guards(max_promote_share=args.max_promote_share), keep_crops=args.keep_crops)
+                      tz_name=args.tz, dry_run=args.dry_run, guards=Guards(max_promote_share=args.max_promote_share), keep_crops=args.keep_crops,
+                      vet=_vet(args), verify_root=getattr(args, "verify_root", None))
         except Exception as e:  # one bad day must not stop the rest of a range; never echo the token
             print(f"[run] {args.facility} {day}: FAILED: {client.redact(f'{e.__class__.__name__}: {e}')}",
                   file=sys.stderr)
@@ -387,7 +403,7 @@ def cmd_verify_build(args) -> None:
     from .verify import build_night
     for day in _run_days(args):
         build_night(Path(args.runs), Path(args.refs), Path(args.out), str(args.facility), day, n=args.n,
-                    run_id=args.run_id)
+                    n_check=args.n_check, run_id=args.run_id)
 
 
 def cmd_verify_serve(args) -> None:
@@ -549,6 +565,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="decide as production does: no alias file (ids folded through merges only) and only labels "
                          "of this facility's own roster; the labels file still reports alias keys for scoring")
     sp.add_argument("--setup")
+    sp.add_argument("--label-check", nargs="?", const="default",
+                    help="learn only from staff labels someone looked at (vetting.py); optional JSON of VetPolicy overrides")
+    sp.add_argument("--verify-root", help="check page root: refs.json and each finished night's answers settle the "
+                                          "pictures they cover")
     sp.add_argument("--out", required=True)
     sp.set_defaults(fn=cmd_shadow)
 
@@ -576,6 +596,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="guard: promotions / sightings above this are reported as a guard failure (the worker never "
                          "activates; activation is on the app host)")
     sp.add_argument("--keep-crops", action="store_true", help="keep the downloaded crops (debugging)")
+    sp.add_argument("--label-check", nargs="?", const="default",
+                    help="learn only from staff labels someone looked at (vetting.py); optional JSON of VetPolicy overrides")
+    sp.add_argument("--verify-root", help="check page root: refs.json and each finished night's answers settle the "
+                                          "pictures they cover")
     sp.set_defaults(fn=cmd_run)
 
     sp = sub.add_parser("adjudicate-sample")
@@ -654,6 +678,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--day", default="auto", help="auto (yesterday, facility time), YYYY-MM-DD, or A..B")
     sp.add_argument("--tz", default="Asia/Shanghai")
     sp.add_argument("--n", type=int, default=20)
+    sp.add_argument("--n-check", type=int, help="most disagreement pictures added to the night (default: all)")
     sp.add_argument("--run-id", help="this run instead of the newest non-dry one (one day only)")
     sp.set_defaults(fn=cmd_verify_build)
 

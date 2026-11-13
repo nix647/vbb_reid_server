@@ -14,10 +14,12 @@ import csv
 import json
 import time
 import uuid
+from dataclasses import asdict
 from pathlib import Path
 
 from .decide import BodyIndex, MachineLabel, Thresholds, decide_day, face_scores
 from .pipeline import RefPolicy, Workspace, org_facilities
+from .vetting import SETTLED, VetPolicy, clear_crop, vet_labels
 
 RUN_AT_DAY_END = "run"  # label cutoff = the nightly run's start for that day
 
@@ -31,31 +33,67 @@ def _cutoff(ws: Workspace, facility: str, day: str, label_cutoff_ms):
 LABEL_FIELDS = ["run_id", "sighting_id", "facility_id", "day", "did", "room_id", "board_state",
                 "board_person_id", "state", "relation", "person_id", "person_key", "via", "confidence",
                 "margin", "face_sim", "body_sim", "human_labeled", "evidence",
-                "image_url"]  # last: the verification page shows this picture (added 0.2.3)
+                "image_url",  # the verification page shows this picture (added 0.2.3)
+                "human_state", "human_person_id", "label_check"]  # the staff label and its check (0.2.4)
 
 
 def decide_night(ws: Workspace, facility: str, day: str, th: Thresholds, policy: RefPolicy,
-                 label_cutoff_ms: int | None) -> dict:
+                 label_cutoff_ms: int | None, vet: VetPolicy | None = None,
+                 trusted: dict[str, str | None] | None = None) -> dict:
     """The decision for one facility-day, shared by the offline shadow and the production run.
-    -> {labels, sightings, refs, seeds}."""
+    ``vet``: learn only from staff labels someone looked at (``vetting``); ``trusted`` are your check-page
+    answers (``vetting.load_trusted``). -> {labels, sightings, refs, seeds, vetting}."""
     ex = ws.export
     facs = org_facilities(ex, facility)
     roster = ex.roster(facility)
-    refs = ws.references(facs, day, label_cutoff_ms=label_cutoff_ms, policy=policy,
-                         roster_ids=ex.roster_ids(facility) if policy.roster_only else None)
+    vetting = label_filter = crop_filter = None
+    if vet is not None:
+        cands = [s for s in ex.sightings if s.facility_id in facs and s.human_state == "known" and s.day <= day
+                 and (label_cutoff_ms is None or (s.corrected_ts is not None and s.corrected_ts < label_cutoff_ms))]
+        vetting = vet_labels(ws, cands, trusted or {}, vet)
+        trusted_ids = vetting.trusted
+        label_filter = lambda s: s.sighting_id in trusted_ids  # noqa: E731
+        crop_filter = lambda ft, i: clear_crop(ft, i, vet)  # noqa: E731
+    refs = ws.references(facs, day, label_cutoff_ms=label_cutoff_ms, policy=policy, label_filter=label_filter,
+                         crop_filter=crop_filter, roster_ids=ex.roster_ids(facility) if policy.roster_only else None)
     seeds = ws.human_seeds(facility, day, label_cutoff_ms)
+    if vetting is not None:
+        seeds = {sid: k for sid, k in seeds.items() if sid in trusted_ids}
     sightings = ex.by_facility_day(facility, day)
     probe_faces, body, body_crops = ws.probe_inputs(facility, day)
     fs = face_scores(probe_faces, refs, th)
     labels: list[MachineLabel] = decide_day(sightings, fs, body, body_crops, roster, ex.key, th, human_seeds=seeds,
                                             body_index=BodyIndex.build(sightings, body) if body else None)
-    return {"labels": labels, "sightings": sightings, "refs": refs, "seeds": seeds}
+    return {"labels": labels, "sightings": sightings, "refs": refs, "seeds": seeds, "vetting": vetting}
+
+
+def disagreements(decided: dict, key) -> list[dict]:
+    """Staff labels of the night the machine names someone else for, decided without them: ``known`` labels
+    nobody looked at (one someone looked at, or you answered, is settled; the job learned from it, so agreement
+    there means nothing) and stranger labels (never learned from). ``key``: person_id -> identity key."""
+    vetting = decided.get("vetting")
+    if vetting is None:
+        return []
+    by_sid = {s.sighting_id: s for s in decided["sightings"]}
+    out = []
+    for l in decided["labels"]:
+        s = by_sid[l.sighting_id]
+        if l.state != "known" or s.human_state not in ("known", "stranger"):
+            continue
+        if s.human_state == "known":
+            if vetting.status.get(s.sighting_id) in SETTLED or key(s.human_person_id) == l.person_key:
+                continue
+        out.append({"sighting_id": s.sighting_id, "url": s.image_url or "", "machine": l.person_id,
+                    "staff": s.human_person_id if s.human_state == "known" else None,
+                    "check": vetting.status.get(s.sighting_id, "stranger"), "via": l.via})
+    return out
 
 
 def shadow_run(ws: Workspace, facility: str, day: str, th: Thresholds, out_dir: str | Path, *,
                policy: RefPolicy = RefPolicy(include_same_day=True), label_cutoff_ms: int | str | None = RUN_AT_DAY_END,
                model_name: str = "", run_id: str | None = None, decided: dict | None = None,
-               report_key=None, extra: dict | None = None, log=print) -> dict:
+               report_key=None, extra: dict | None = None, vet: VetPolicy | None = None,
+               trusted: dict[str, str | None] | None = None, log=print) -> dict:
     """``label_cutoff_ms``: ``"run"`` (default, production-like), an epoch-ms value, or ``None``
     (every label in the export — only for debugging; it leaks the future).
     ``decided``: a ``decide_night`` result to write instead of deciding again (the production run).
@@ -66,8 +104,9 @@ def shadow_run(ws: Workspace, facility: str, day: str, th: Thresholds, out_dir: 
     started = time.time()
     label_cutoff_ms = _cutoff(ws, facility, day, label_cutoff_ms)
     if decided is None:
-        decided = decide_night(ws, facility, day, th, policy, label_cutoff_ms)
+        decided = decide_night(ws, facility, day, th, policy, label_cutoff_ms, vet=vet, trusted=trusted)
     labels, sightings, refs, seeds = decided["labels"], decided["sightings"], decided["refs"], decided["seeds"]
+    vetting = decided.get("vetting")
     by_sid = {s.sighting_id: s for s in sightings}
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -92,6 +131,8 @@ def shadow_run(ws: Workspace, facility: str, day: str, th: Thresholds, out_dir: 
                 "body_sim": "" if l.body_sim is None else l.body_sim,
                 "human_labeled": int(human), "evidence": json.dumps(l.evidence, ensure_ascii=False),
                 "image_url": s.image_url or "",
+                "human_state": s.human_state or "", "human_person_id": s.human_person_id or "",
+                "label_check": vetting.status.get(l.sighting_id, "") if vetting is not None else "",
             })
     run = {
         "run_id": run_id, "facility_id": facility, "day": day, "model": model_name,
@@ -99,6 +140,8 @@ def shadow_run(ws: Workspace, facility: str, day: str, th: Thresholds, out_dir: 
         "ref_policy": policy.__dict__, "label_cutoff_ms": label_cutoff_ms,
         "references": {k: refs.n_sightings(k) for k in refs}, "same_day_seeds": len(seeds),
         "counts": counts, "started_at": started, "finished_at": time.time(),
+        "label_check": None if vetting is None else {"policy": asdict(vet) if vet else None, "counts": vetting.counts()},
+        "disagreements": disagreements(decided, ws.export.key),
         **(extra or {}),
     }
     (out / f"run_{facility}_{day}_{run_id[:8]}.json").write_text(json.dumps(run, indent=2, ensure_ascii=False))

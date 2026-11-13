@@ -68,6 +68,19 @@ def _csv_joined_spans(extras: str | None) -> tuple[tuple[int, int], ...]:
     return joined_spans(parsed.get("joined_tracks")) if isinstance(parsed, dict) else ()
 
 
+def _csv_reviewed(extras: str | None, corrected_ts: int | None, state: str | None, person_id: str | None) -> bool:
+    """The backend's "someone looked at this picture" mark. ``extras.reviewed`` holds what the correction that set
+    it wrote, ``"<corrected_ts>:<corrected_state>:<corrected_person_id>"``, and counts only while all three still
+    match the row (the backend's rule, nursery ``Common/ReviewedMark``; change the format on both sides together).
+    A label or time rewritten by anything that didn't maintain the mark is not reviewed."""
+    try:
+        parsed = json.loads(extras) if extras else None
+    except ValueError:
+        return False
+    mark = parsed.get("reviewed") if isinstance(parsed, dict) else None
+    return isinstance(mark, str) and corrected_ts is not None and mark == f"{corrected_ts}:{state or ''}:{person_id or ''}"
+
+
 @dataclass(frozen=True)
 class Sighting:
     sighting_id: str
@@ -91,6 +104,10 @@ class Sighting:
     corrected_ts: int | None  # ms
     day: str  # facility-local YYYY-MM-DD of capture_ts
     joined_spans_ms: tuple[tuple[int, int], ...] = ()  # each track of a joined sighting; () = one track
+    # Someone looked at this very picture when labelling it (backend ``extras.reviewed``, owner 2026-11-11/12):
+    # the main photo of a row renamed with nothing ticked, a ticked picture, or the profile photo of an action at
+    # the top of a person's page. With the label check on, only such labels are learned from (vetting.py).
+    human_reviewed: bool = False
 
     @property
     def human_labeled(self) -> bool:
@@ -309,6 +326,8 @@ def load_export(root: str | Path, aliases_csv: str | Path | None = None) -> Expo
             corrected_ts=_int(r.get("corrected_ts")),
             day=local_day(cap, facility_tz.get(fac, "Asia/Shanghai")),
             joined_spans_ms=_csv_joined_spans(r.get("extras")),
+            human_reviewed=_csv_reviewed(r.get("extras"), _int(r.get("corrected_ts")), r.get("corrected_state"),
+                                         r.get("corrected_person_id")),
         ))
     sightings.sort(key=lambda s: (s.facility_id, s.capture_ts, s.sighting_id))
     aliases, names = load_aliases(Path(aliases_csv) if aliases_csv else None)
