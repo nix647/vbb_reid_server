@@ -19,7 +19,7 @@ from pathlib import Path
 
 from .decide import BodyIndex, MachineLabel, Thresholds, decide_day, face_scores
 from .pipeline import RefPolicy, Workspace, org_facilities
-from .vetting import SETTLED, VetPolicy, clear_crop, vet_labels
+from .vetting import SETTLED, VetPolicy, answered_labels, clear_crop, learned_as, vet_labels
 
 RUN_AT_DAY_END = "run"  # label cutoff = the nightly run's start for that day
 
@@ -51,18 +51,26 @@ def decide_night(ws: Workspace, facility: str, day: str, th: Thresholds, policy:
     facs = org_facilities(ex, facility)
     roster = ex.roster(facility)
     vetting = label_filter = crop_filter = None
+    answered = []
     if vet is not None:
-        cands = [s for s in ex.sightings if s.facility_id in facs and s.human_state == "known" and s.day <= day
+        # tech-team answers on pictures no user renamed, or renamed to someone else; last, so their status wins
+        answered = answered_labels(ex, trusted or {})
+        cands = [s for s in [*ex.sightings, *answered] if s.facility_id in facs and s.human_state == "known"
+                 and s.day <= day
                  and (label_cutoff_ms is None or (s.corrected_ts is not None and s.corrected_ts < label_cutoff_ms))]
         vetting = vet_labels(ws, cands, trusted or {}, vet)
-        trusted_ids = vetting.trusted
-        label_filter = lambda s: s.sighting_id in trusted_ids  # noqa: E731
+        learned = learned_as(vetting, trusted or {}, ex.key)
+        label_filter = lambda s: learned(s.sighting_id, ex.key(s.human_person_id))  # noqa: E731
         crop_filter = lambda ft, i: clear_crop(ft, i, vet)  # noqa: E731
     refs = ws.references(facs, day, label_cutoff_ms=label_cutoff_ms, policy=policy, label_filter=label_filter,
-                         crop_filter=crop_filter, roster_ids=ex.roster_ids(facility) if policy.roster_only else None)
+                         crop_filter=crop_filter, extra_labels=answered,
+                         roster_ids=ex.roster_ids(facility) if policy.roster_only else None)
     seeds = ws.human_seeds(facility, day, label_cutoff_ms)
     if vetting is not None:
-        seeds = {sid: k for sid, k in seeds.items() if sid in trusted_ids}
+        seeds = {sid: k for sid, k in seeds.items() if learned(sid, k)}
+        for s in answered:  # a picture of tonight answered before the run seeds it under the answer
+            if s.day == day and learned(s.sighting_id, ex.key(s.human_person_id)):
+                seeds[s.sighting_id] = ex.key(s.human_person_id)
     sightings = ex.by_facility_day(facility, day)
     probe_faces, body, body_crops = ws.probe_inputs(facility, day)
     fs = face_scores(probe_faces, refs, th)

@@ -107,6 +107,7 @@ class Workspace:
                    exclude_days: set[str] | None = None, allow_after: bool = False,
                    label_filter: Callable[[Sighting], bool] | None = None,
                    crop_filter: Callable[[FaceTable, int], bool] | None = None,
+                   extra_labels: list[Sighting] = (),
                    roster_ids: set[str] | None = None) -> Refs:
         """Face reference vectors per identity key.
 
@@ -117,6 +118,7 @@ class Workspace:
         - ``policy.roster_only``: only labels whose folded person is in ``roster_ids`` (required then).
         - ``label_filter`` / ``crop_filter``: only these labels, and of their crops only these (the label
           check, ``vetting``: a sighting can have several crops and not all of them show one clear face).
+        - ``extra_labels``: labels that aren't in the export, under the same rules (answered pictures, ``vetting``).
         """
         if policy.roster_only and roster_ids is None:
             raise ValueError("RefPolicy.roster_only needs roster_ids (the probe facility's registered ids)")
@@ -126,7 +128,7 @@ class Workspace:
         lo = (pd - timedelta(days=policy.window_days)).isoformat()
         rows: dict[str, list[tuple[int, str, np.ndarray]]] = {}
         wanted: dict[tuple[str, str], list[Sighting]] = {}
-        for s in self.export.sightings:
+        for s in [*self.export.sightings, *extra_labels]:
             if s.facility_id not in facilities or s.human_state != "known":
                 continue
             if label_cutoff_ms is not None and (s.corrected_ts is None or s.corrected_ts >= label_cutoff_ms):

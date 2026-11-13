@@ -255,3 +255,51 @@ def test_the_rule_is_on_unless_a_replay_turns_it_off():
                      ("shadow", ["--export", "e", "--emb", "m", "--facility", "3", "--out", "o"])):
         assert _vet(p.parse_args([cmd, *req])) == VetPolicy(), cmd
         assert _vet(p.parse_args([cmd, *req, "--no-label-check"])) is None, cmd
+
+
+def test_an_answer_teaches_the_face_even_when_no_user_renamed_the_picture(tmp_path):
+    """Owner 2026-11-13: every confirmed picture is learned from, a tech-team answer on the check page included.
+    Most answered pictures are machine names no user renamed; their faces are in that night's cache."""
+    from vbb_reid_server.vetting import Trusted
+    labs = [_lab(f"a{j}", "pA", 100, reviewed=True) for j in range(2)]
+    ws = _ws(tmp_path, [(s.sighting_id, near(A, 0.05, RNG)) for s in labs], labs)
+    old = "2026-10-18"
+    write_face_cache(tmp_path / "emb", "3", old, [(sid, 0, near(A, 0.05, RNG), 0.9, 80.0)
+                                                 for sid in ("t0", "t1", "late", "nobody")])
+    trusted = Trusted({"t0": "pA", "t1": "pA", "late": "pA", "nobody": None, "nocache": "pA"},
+                      info={"t0": ("3", old, 50), "t1": ("3", old, 60), "late": ("3", old, 20_000),
+                            "nobody": ("3", old, 50), "nocache": ("3", "2026-10-17", 50)})
+    assert decide_night(ws, "3", DAY, TH, POL, label_cutoff_ms=10_000, vet=VetPolicy())["refs"].n_sightings("pA") == 2
+    on = decide_night(ws, "3", DAY, TH, POL, label_cutoff_ms=10_000, vet=VetPolicy(), trusted=trusted)
+    assert on["refs"].n_sightings("pA") == 4  # a0, a1 and the two answered pictures
+    st = on["vetting"].status
+    assert (st["t0"], st["t1"], st["nocache"]) == ("answered", "answered", "no_face")
+    assert "late" not in st and "nobody" not in st  # answered after the run started; "someone else" names nobody
+    assert not {"t0", "t1"} & set(on["seeds"])  # earlier days teach the face; seeds are tonight's pictures only
+
+
+def test_trusted_answers_say_where_and_when_they_were_given(tmp_path):
+    root = tmp_path / "verify"
+    (root / "3_2026-10-20").mkdir(parents=True)
+    (root / "refs.json").write_text(json.dumps({"facility_id": "3", "built_at": 1_700_000_000, "people": [
+        {"key": "pA", "person_id": "pA", "photos": [{"sighting_id": "r1", "day": "2026-09-30"}]}]}))
+    (root / "3_2026-10-20" / "frozen.json").write_text(json.dumps({
+        "facility_id": "3", "day": "2026-10-20", "people": [{"key": "pA", "person_id": "pA"}],
+        "items": [{"sighting_id": "n1"}]}))
+    (root / "3_2026-10-20" / "marks.json").write_text(json.dumps({"answers": {"0": "pA"}, "submitted": True,
+                                                                  "updated_at": 1_700_000_500}))
+    t = load_trusted(root)
+    assert t == {"r1": "pA", "n1": "pA"}
+    assert t.info == {"r1": ("3", "2026-09-30", 1_700_000_000_000), "n1": ("3", "2026-10-20", 1_700_000_500_000)}
+
+
+def test_your_answer_wins_over_a_rename_nobody_looked_at(tmp_path):
+    """A user renamed w0 to pA without looking; the tech team answered pB. The picture is learned as pB, never pA,
+    as a face example and as a same-day seed. A matching answer (r0) is learned once, not twice."""
+    labs = [_lab("w0", "pA", 100), _lab("r0", "pA", 100)] + [_lab(f"a{j}", "pA", 100, reviewed=True) for j in range(2)]
+    ws = _ws(tmp_path, [(s.sighting_id, near(A, 0.05, RNG)) for s in labs], labs)
+    from vbb_reid_server.vetting import Trusted
+    trusted = Trusted({"w0": "pB", "r0": "pA"}, info={"w0": ("3", DAY, 50), "r0": ("3", DAY, 50)})
+    on = decide_night(ws, "3", DAY, TH, POL, label_cutoff_ms=10_000, vet=VetPolicy(), trusted=trusted)
+    assert (on["refs"].n_sightings("pA"), on["refs"].n_sightings("pB")) == (3, 1)  # a0, a1, r0 | w0
+    assert on["seeds"]["w0"] == "pB" and on["seeds"]["r0"] == "pA"
