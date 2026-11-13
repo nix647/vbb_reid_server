@@ -67,6 +67,7 @@ def test_a_picture_joins_when_the_machine_disagrees_with_a_name_nobody_confirmed
         _row("looked", human_state="known", human="pB", reviewed=True),     # a person looked: confirmed
         _row("stranger", "agree", board_state="known", board="pA", human_state="stranger"),  # staff: stranger, unchecked
         _row("unsure", "agree", board_state="known", board="pA", human_state="reset"),       # "can't tell" is no name
+        _row("unsure_looked", human_state="reset", reviewed=True),  # a user ticked it and chose 拿不准: confirmed
         _row("relabel", "relabel", board_state="known", board="pB", state="flag"),  # camera pB, machine pA
         _row("mixed", "mixed", machine=None, state="flag"),                 # the machine names nobody
         _row("conflict", "conflict", state="flag", human_state="known", human="pB"),  # face and body disagree:
