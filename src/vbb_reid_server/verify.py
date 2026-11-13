@@ -455,8 +455,8 @@ def index_html(store: Store) -> str:
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Nightly name check</title>{_STYLE}</head>
 <body><main><h2>Nightly name check</h2>
-<p class=muted>Each night, a random sample of the new names the machine gave (labels are still hidden in the app),
-mixed with pictures where the machine and a staff label disagree.
+<p class=muted>Each night, a random sample of the new names the machine gave (labels are still hidden in the app):
+it measures how often the machine is right.
 Open a night, say who each picture shows, then press "I'm done". Results appear only after that.</p>
 <table><tr><th>night</th><th>new names</th><th>sample</th><th>status</th><th>result</th><th>reviewer</th></tr>{''.join(rows)}</table>
 <h3>All finished nights, by how the name was made</h3><table>{head.format('via')}{tally(tot_via, lambda k: k)}</table>
