@@ -38,8 +38,6 @@ from .data import Sighting
 
 FACE_OK = ("answered", "reviewed")  # trusted, with a clear crop: teaches the face and seeds the day
 NO_CLEAR_FACE = ("no_face", "two_faces", "poor_face")  # trusted, no clear crop: seeds the day only
-# Settled: someone looked at it or you answered it. Never put on the check page as a disagreement.
-SETTLED = FACE_OK + NO_CLEAR_FACE + ("answer_disagrees",)
 
 
 @dataclass(frozen=True)
@@ -74,8 +72,9 @@ class Trusted(dict):
 
 
 def load_trusted(verify_root: str | Path | None) -> Trusted:
-    """sid -> person_id you said it shows (None = someone not on the list), from ``refs.json`` and every finished
-    night's ``marks.json``. A picture given two different answers is left out."""
+    """sid -> person_id you said it shows (None = someone not on the list), from ``refs.json``, every finished
+    night's ``marks.json`` and the correction list's batch review (``corrections.load_answers``; can't tell names
+    nobody). A picture given two different answers is left out."""
     if verify_root is None:
         return Trusted()
     root = Path(verify_root)
@@ -106,6 +105,14 @@ def load_trusted(verify_root: str | Path | None) -> Trusted:
             seen.setdefault(str(it["sighting_id"]), set()).add(by_key.get(a))  # "other" -> None
             if fz.get("facility_id") and fz.get("day"):
                 info[str(it["sighting_id"])] = (str(fz["facility_id"]), str(fz["day"]), int(mk.get("updated_at") or 0) * 1000)
+    from .corrections import load_answers  # lazy: corrections imports the page module, the run needs neither
+    for sid, a in load_answers(root).items():
+        if not isinstance(a, dict) or a.get("verdict") not in ("right", "wrong"):
+            continue  # can't tell, or a row this version can't read
+        pid = a.get("person_id")
+        seen.setdefault(str(sid), set()).add(None if pid is None else str(pid))
+        if a.get("facility_id") and a.get("day"):
+            info[str(sid)] = (str(a["facility_id"]), str(a["day"]), int(a.get("at") or 0) * 1000)
     keep = {sid: next(iter(v)) for sid, v in seen.items() if len(v) == 1}
     return Trusted(keep, info={sid: info[sid] for sid in keep if sid in info})
 

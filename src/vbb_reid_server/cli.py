@@ -403,7 +403,7 @@ def cmd_verify_build(args) -> None:
     from .verify import build_night
     for day in _run_days(args):
         build_night(Path(args.runs), Path(args.refs), Path(args.out), str(args.facility), day, n=args.n,
-                    n_check=args.n_check, run_id=args.run_id)
+                    run_id=args.run_id)
 
 
 def cmd_corrections(args) -> None:
@@ -690,8 +690,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--day", default="auto", help="auto (yesterday, facility time), YYYY-MM-DD, or A..B")
     sp.add_argument("--tz", default="Asia/Shanghai")
     sp.add_argument("--n", type=int, default=20)
-    sp.add_argument("--n-check", type=int, default=0,
-                    help="disagreement pictures added to the night (default 0: they go to the correction list)")
     sp.add_argument("--run-id", help="this run instead of the newest non-dry one (one day only)")
     sp.set_defaults(fn=cmd_verify_build)
 
@@ -703,7 +701,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--tz", default="Asia/Shanghai")
     sp.set_defaults(fn=cmd_corrections)
 
-    sp = sub.add_parser("verify-serve", help="the verification page on 127.0.0.1, for an ssh tunnel")
+    sp = sub.add_parser("verify-serve", help="the verification page and the correction list's batch review on "
+                                             "127.0.0.1, for an ssh tunnel")
     sp.add_argument("--root", required=True, help="verification root")
     sp.add_argument("--port", type=int, default=8770)
     sp.set_defaults(fn=cmd_verify_serve)

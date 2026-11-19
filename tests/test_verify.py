@@ -1,4 +1,5 @@
-"""Nightly verification page (0.2.3): references, the nightly draw, the server's guards, scoring."""
+"""Nightly verification page (0.2.3): references, the nightly draw, the server's guards, scoring; and the
+correction list's batch review on the same server (0.2.6, plan decision 37)."""
 
 from __future__ import annotations
 
@@ -114,6 +115,7 @@ def test_the_draw_takes_only_pushed_new_names_from_the_real_run_and_never_redraw
     assert data["run_id"] == "a" * 32 and data["pool"] == 31 and len(sids) == 20 == len(set(sids))
     assert set(sids) <= {f"p{i}" for i in range(30)} | {"body1"}
     assert data["pool_by_via"] == {"body": 1, "face": 30}
+    assert "disagreements" not in data and not any("kind" in it for it in data["items"])  # the sample only
     assert not os.access(f, os.W_OK)
     before = f.read_bytes()
     build_night(runs, _refs(tmp_path), out, "3", "2026-11-06", n=5, log=lambda *_: None)
@@ -229,6 +231,10 @@ def test_scoring():
     sc = score_night(fz, {"answers": {"0": "H1", "1": "other", "2": "cant_tell"}})
     assert (sc["right"], sc["wrong"], sc["cant_tell"], sc["unanswered"]) == (1, 1, 1, 1)
     assert sc["per_via"] == {"face": [1, 0], "body": [0, 1]} and sc["wrong_items"][0]["i"] == 1
+    # a disagreement item an older worker could add (0.2.4-0.2.5, --n-check) is never scored as the sample
+    fz["items"].append({"kind": "check", "person_id": "pA3", "via": "face", "face_sim": "", "body_sim": ""})
+    sc = score_night(fz, {"answers": {"0": "H1", "1": "other", "2": "cant_tell", "4": "H2"}})
+    assert (sc["right"], sc["wrong"], sc["cant_tell"], sc["unanswered"]) == (1, 1, 1, 1)
 
 
 def test_a_link_off_the_picture_site_is_never_fetched(tmp_path):
@@ -266,3 +272,79 @@ def test_a_hidden_person_does_not_shift_the_others_reference_pictures(server):
     pd = page_data(Store(root).frozen(night))
     assert [(p["key"], p["ref"]) for p in pd["people"]] == [("H1", 1)]
     assert _req(f"{base}/ref/{night}/1/0") == (200, b"JPEG") and fetched == [URL.format("r1")]
+
+
+# --- the correction list's batch review --------------------------------------------------
+
+def _listed(root):
+    """c1, c2: open, the machine says H1 (pA3); c3: open, H2's; c4: closed; h1: waiting for its check page."""
+    from vbb_reid_server.corrections import list_path
+    item = {"facility_id": "3", "day": "2026-11-06", "relation": "promote", "via": "face", "board": "uncertain",
+            "staff": None, "against": ["board"], "run_id": "a" * 32, "added_at": 1, "status": "open"}
+    items = {sid: item | {"sighting_id": sid, "url": URL.format(sid), "machine": pid}
+             for sid, pid in (("c1", "pA3"), ("c2", "pA3"), ("c3", "pB3"), ("c4", "pA3"))}
+    items["c4"] |= {"status": "closed", "closed_reason": "reviewed"}
+    list_path(root).parent.mkdir(parents=True, exist_ok=True)
+    list_path(root).write_text(json.dumps({"items": items, "held": {
+        "h1": item | {"sighting_id": "h1", "url": URL.format("h1"), "machine": "pA3"}}}))
+    (root / "refs.json").write_text(json.dumps({"built_at": 1, "people": [
+        {"person_id": "pA3", "key": "H1", "name": "", "photos": [{"sighting_id": "r1", "day": "d", "url": URL.format("r1")}]},
+        {"person_id": "pB3", "key": "H2", "name": "", "photos": []}]}))
+
+
+@pytest.fixture
+def list_server(tmp_path):
+    root, _ = _night(tmp_path)
+    _listed(root)
+    fetched = []
+    from http.server import ThreadingHTTPServer
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(Store(root, fetch=lambda url: fetched.append(url) or b"JPEG")))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{httpd.server_address[1]}", root, fetched
+    httpd.shutdown()
+
+
+REVIEW = {"Content-Type": "application/json", "X-Review": "1"}
+
+
+def test_the_list_page_shows_each_person_with_pictures_left_and_no_links(list_server):
+    base, root, _ = list_server
+    page = _req(f"{base}/fix")[1].decode()
+    assert "/fix/p/pA3" in page and "/fix/p/pB3" in page and IMAGE_PREFIX not in page
+    batch = _req(f"{base}/fix/p/pA3")[1].decode()
+    assert '"c1"' in batch and '"c2"' in batch  # this person's open pictures, by id only
+    for leak in ('"c3"', '"c4"', '"h1"', IMAGE_PREFIX, "promote", "uncertain", "face_sim"):
+        assert leak not in batch, leak
+    assert _req(f"{base}/fix/p/..%2Fx")[0] == 404
+
+
+def test_a_batch_saves_only_from_its_own_page(list_server):
+    from vbb_reid_server.corrections import answers_path
+    base, root, _ = list_server
+    body = json.dumps({"seen": ["c1"], "marks": {}}).encode()
+    assert _req(f"{base}/fix/p/pA3", body, {"Content-Type": "application/json"}, "POST")[0] == 403
+    assert _req(f"{base}/fix/p/pA3", body, REVIEW | {"Host": "evil.example"}, "POST")[0] == 403
+    assert _req(f"{base}/fix/p/pA3", json.dumps({"seen": ["c3"]}).encode(), REVIEW, "POST")[0] == 400  # H2's
+    assert _req(f"{base}/fix/p/pA3", json.dumps({"seen": ["h1"]}).encode(), REVIEW, "POST")[0] == 400  # held
+    assert not answers_path(root).exists()
+    code, out = _req(f"{base}/fix/p/pA3", body, REVIEW, "POST")
+    assert code == 200 and json.loads(out)["right"] == 1
+    assert '"c1"' not in _req(f"{base}/fix/p/pA3")[1].decode()  # answered: never shown again
+
+
+def test_list_pictures_come_only_from_open_list_items(list_server):
+    base, root, fetched = list_server
+    assert _req(f"{base}/fiximg/c1") == (200, b"JPEG")
+    for sid in ("c4", "h1", "zz"):  # closed, waiting for the check page, not on the list
+        assert _req(f"{base}/fiximg/{sid}")[0] == 404, sid
+    assert _req(f"{base}/fixref/0/0") == (200, b"JPEG")
+    assert _req(f"{base}/fixref/1/0")[0] == 404
+    assert fetched == [URL.format("c1"), URL.format("r1")]
+    for path in ("/fix", "/fix/p/pA3", "/fiximg/c1", "/fixref/0/0"):
+        assert _req(base + path, headers={"Host": "evil.example"})[0] == 403, path
+
+
+def test_the_check_page_links_the_list_and_has_no_disagreement_section(list_server):
+    base, _, _ = list_server
+    page = _req(f"{base}/")[1].decode()
+    assert "Disagreements decided" not in page and "href='/fix'" in page

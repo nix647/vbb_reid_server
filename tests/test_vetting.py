@@ -1,4 +1,4 @@
-"""Learn only from pictures someone looked at (owner 2026-11-11/12, plan decision 34), and the disagreement queue."""
+"""Learn only from pictures someone looked at (owner 2026-11-11/12, plan decision 34)."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from vbb_reid_server.data import Export, Person, load_export
 from vbb_reid_server.decide import Thresholds
 from vbb_reid_server.embed import _dir
 from vbb_reid_server.pipeline import RefPolicy, Workspace
-from vbb_reid_server.shadow import decide_night, disagreements, shadow_run
-from vbb_reid_server.verify import IMAGE_PREFIX, build_night, page_data, score_night
+from vbb_reid_server.shadow import decide_night, shadow_run
+from vbb_reid_server.verify import IMAGE_PREFIX
 from vbb_reid_server.vetting import VetPolicy, load_trusted, vet_labels
 
 DAY = "2026-10-20"
@@ -126,36 +126,20 @@ def test_trusted_pictures_come_from_refs_and_finished_nights_only(tmp_path):
     assert t == {"r1": "pA", "n1": "pB", "n2": None}  # "both" got two answers; can't tell and "late" (unfinished) skipped
 
 
-def test_labels_nobody_looked_at_are_queued_when_the_machine_disagrees(tmp_path):
-    ws = _night(tmp_path)
-    assert disagreements(decide_night(ws, "3", DAY, TH, POL, label_cutoff_ms=10_000), ws.export.key) == []
-    on = decide_night(ws, "3", DAY, TH, POL, label_cutoff_ms=10_000, vet=VetPolicy())
-    d = {x["sighting_id"]: x for x in disagreements(on, ws.export.key)}
-    assert (d["q0"]["staff"], d["q0"]["machine"], d["q0"]["check"]) == ("pA", "pB", "not_reviewed")
-    assert d["s0"]["staff"] is None and d["s0"]["machine"] == "pA"  # a stranger label the machine names
-    assert not {"a0", "b0"} & set(d)  # pictures someone looked at are never queued
-
-
-def test_a_picture_you_already_answered_is_never_queued_again(tmp_path):
-    ws = _night(tmp_path)
-    on = decide_night(ws, "3", DAY, TH, POL, label_cutoff_ms=10_000, vet=VetPolicy(), trusted={"q0": "pB"})
-    assert on["vetting"].status["q0"] == "answer_disagrees"
-    assert "q0" not in {x["sighting_id"] for x in disagreements(on, ws.export.key)}
-
-
 def test_labels_made_after_the_run_are_not_checked_or_used(tmp_path):
     ws = _night(tmp_path)
     on = decide_night(ws, "3", DAY, TH, POL, label_cutoff_ms=450, vet=VetPolicy())
     assert "q0" not in on["vetting"].status
 
 
-def test_disagreements_reach_the_page_blind_and_are_scored_apart(tmp_path):
+def test_the_run_files_carry_each_staff_label_and_its_check(tmp_path):
     ws = _night(tmp_path)
     runs = tmp_path / "runs"
     shadow_run(ws, "3", DAY, TH, runs, policy=POL, label_cutoff_ms=10_000, run_id="r" * 32, vet=VetPolicy(),
                extra={"dry_run": False})
     meta = json.loads(next(runs.glob("run_*.json")).read_text())
-    assert meta["label_check"]["counts"]["not_reviewed"] == 4 and len(meta["disagreements"]) == 2
+    assert meta["label_check"]["counts"]["not_reviewed"] == 4
+    assert "disagreements" not in meta  # staff-label disagreements are the correction list's job (corrections.py)
     with next(runs.glob("labels_*.csv")).open() as fh:
         labels = {r["sighting_id"]: r for r in csv.DictReader(fh)}
     row = labels["q0"]
@@ -168,44 +152,6 @@ def test_disagreements_reach_the_page_blind_and_are_scored_apart(tmp_path):
     assert set(staff) == {s.sighting_id for s in ws.export.sightings if s.human_state}  # u0-u2 too: never named
     assert {"u0", "u1", "u2"} <= set(staff) - set(labels)
     assert (staff["a0"]["human_reviewed"], staff["q0"]["human_reviewed"], staff["s0"]["human_state"]) == ("1", "0", "stranger")
-    refs = tmp_path / "refs.json"
-    refs.write_text(json.dumps({"people": [{"key": "pA", "person_id": "pA", "photos": [{"url": IMAGE_PREFIX + "r"}]},
-                                           {"key": "pB", "person_id": "pB", "photos": [{"url": IMAGE_PREFIX + "r"}]}]}))
-    plain = json.loads(build_night(runs, refs, tmp_path / "plain", "3", DAY).read_text())
-    assert [it["kind"] for it in plain["items"]].count("check") == 0  # by default they go to the correction list
-    fz = json.loads(build_night(runs, refs, tmp_path / "verify", "3", DAY, n_check=None).read_text())
-    checks = [i for i, it in enumerate(fz["items"]) if it["kind"] == "check"]
-    assert fz["disagreements"] == 2 and len(checks) == 2
-    assert "kind" not in json.dumps(page_data(fz)) and "staff" not in json.dumps(page_data(fz))
-    q = next(i for i in checks if fz["items"][i]["sighting_id"] == "q0")
-    s = next(i for i in checks if fz["items"][i]["sighting_id"] == "s0")
-    sc = score_night(fz, {"answers": {str(q): "pA", str(s): "other"}})
-    assert sc["checks"]["staff"] == 1 and sc["checks"]["neither"] == 1
-    assert sc["right"] + sc["wrong"] == 0  # disagreements never count toward the machine's precision
-
-
-def test_disagreements_are_mixed_into_the_sample(tmp_path):
-    runs = tmp_path / "runs"
-    runs.mkdir()
-    from vbb_reid_server.shadow import LABEL_FIELDS
-    with (runs / f"labels_3_{DAY}_rrrrrrrr.csv").open("w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=LABEL_FIELDS)
-        w.writeheader()
-        for i in range(20):
-            w.writerow({k: "" for k in LABEL_FIELDS} | {"sighting_id": f"p{i}", "state": "known", "relation": "promote",
-                                                        "via": "face", "person_id": "pA", "human_labeled": 0,
-                                                        "image_url": IMAGE_PREFIX + f"p{i}"})
-    dis = [{"sighting_id": f"d{i}", "url": IMAGE_PREFIX + f"d{i}", "machine": "pB", "staff": "pA"} for i in range(40)]
-    (runs / f"run_3_{DAY}_rrrrrrrr.json").write_text(json.dumps({"run_id": "r" * 32, "dry_run": False,
-                                                                 "disagreements": dis}))
-    refs = tmp_path / "refs.json"
-    refs.write_text(json.dumps({"people": []}))
-    fz = json.loads(build_night(runs, refs, tmp_path / "verify", "3", DAY, n_check=None).read_text())
-    kinds = [it["kind"] for it in fz["items"]]
-    assert kinds.count("sample") == 20 and kinds.count("check") == 40 and fz["disagreements"] == 40  # all of them, past any old cap of 30
-    capped = json.loads(build_night(runs, refs, tmp_path / "v2", "3", DAY, n_check=5).read_text())
-    assert [it["kind"] for it in capped["items"]].count("check") == 5
-    assert kinds != sorted(kinds, reverse=True)  # not all samples first: the reviewer can't tell them apart
 
 
 def test_the_reviewed_mark_arrives_with_the_backends_references():
@@ -303,3 +249,23 @@ def test_your_answer_wins_over_a_rename_nobody_looked_at(tmp_path):
     on = decide_night(ws, "3", DAY, TH, POL, label_cutoff_ms=10_000, vet=VetPolicy(), trusted=trusted)
     assert (on["refs"].n_sightings("pA"), on["refs"].n_sightings("pB")) == (3, 1)  # a0, a1, r0 | w0
     assert on["seeds"]["w0"] == "pB" and on["seeds"]["r0"] == "pA"
+
+
+def test_correction_list_answers_are_learned_like_check_page_answers(tmp_path):
+    """Owner 2026-11-19 (plan decision 37): a picture confirmed in the list's batch review is learned from, as
+    the person the answer names; can't tell names nobody; two different answers for one picture teach nothing."""
+    root = tmp_path / "verify"
+    (root / "corrections").mkdir(parents=True)
+    (root / "3_2026-10-20").mkdir()
+    row = {"facility_id": "3", "day": "2026-10-19", "at": 7, "machine": "pA"}
+    (root / "corrections" / "answers.json").write_text(json.dumps({"answers": {
+        "ok": row | {"verdict": "right", "person_id": "pA"}, "fix": row | {"verdict": "wrong", "person_id": "pB"},
+        "nobody": row | {"verdict": "wrong", "person_id": None}, "unsure": row | {"verdict": "cant_tell", "person_id": None},
+        "clash": row | {"verdict": "right", "person_id": "pA"}}}))
+    (root / "3_2026-10-20" / "frozen.json").write_text(json.dumps({
+        "facility_id": "3", "day": "2026-10-20", "people": [{"key": "pB", "person_id": "pB"}],
+        "items": [{"sighting_id": "clash"}]}))
+    (root / "3_2026-10-20" / "marks.json").write_text(json.dumps({"answers": {"0": "pB"}, "submitted": True}))
+    t = load_trusted(root)
+    assert t == {"ok": "pA", "fix": "pB", "nobody": None}
+    assert t.info["ok"] == ("3", "2026-10-19", 7000)  # the face is in that day's cache; the run learns it only after

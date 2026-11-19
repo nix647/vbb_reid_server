@@ -19,7 +19,7 @@ from pathlib import Path
 
 from .decide import BodyIndex, MachineLabel, Thresholds, decide_day, face_scores
 from .pipeline import RefPolicy, Workspace, org_facilities
-from .vetting import SETTLED, VetPolicy, answered_labels, clear_crop, learned_as, vet_labels
+from .vetting import VetPolicy, answered_labels, clear_crop, learned_as, vet_labels
 
 RUN_AT_DAY_END = "run"  # label cutoff = the nightly run's start for that day
 
@@ -77,28 +77,6 @@ def decide_night(ws: Workspace, facility: str, day: str, th: Thresholds, policy:
     labels: list[MachineLabel] = decide_day(sightings, fs, body, body_crops, roster, ex.key, th, human_seeds=seeds,
                                             body_index=BodyIndex.build(sightings, body) if body else None)
     return {"labels": labels, "sightings": sightings, "refs": refs, "seeds": seeds, "vetting": vetting}
-
-
-def disagreements(decided: dict, key) -> list[dict]:
-    """Staff labels of the night the machine names someone else for, decided without them: ``known`` labels
-    nobody looked at (one someone looked at, or you answered, is settled; the job learned from it, so agreement
-    there means nothing) and stranger labels (never learned from). ``key``: person_id -> identity key."""
-    vetting = decided.get("vetting")
-    if vetting is None:
-        return []
-    by_sid = {s.sighting_id: s for s in decided["sightings"]}
-    out = []
-    for l in decided["labels"]:
-        s = by_sid[l.sighting_id]
-        if l.state != "known" or s.human_state not in ("known", "stranger"):
-            continue
-        if s.human_state == "known":
-            if vetting.status.get(s.sighting_id) in SETTLED or key(s.human_person_id) == l.person_key:
-                continue
-        out.append({"sighting_id": s.sighting_id, "url": s.image_url or "", "machine": l.person_id,
-                    "staff": s.human_person_id if s.human_state == "known" else None,
-                    "check": vetting.status.get(s.sighting_id, "stranger"), "via": l.via})
-    return out
 
 
 def shadow_run(ws: Workspace, facility: str, day: str, th: Thresholds, out_dir: str | Path, *,
@@ -162,7 +140,6 @@ def shadow_run(ws: Workspace, facility: str, day: str, th: Thresholds, out_dir: 
         "references": {k: refs.n_sightings(k) for k in refs}, "same_day_seeds": len(seeds),
         "counts": counts, "started_at": started, "finished_at": time.time(),
         "label_check": None if vetting is None else {"policy": asdict(vet) if vet else None, "counts": vetting.counts()},
-        "disagreements": disagreements(decided, ws.export.key),
         **(extra or {}),
     }
     (out / f"run_{facility}_{day}_{run_id[:8]}.json").write_text(json.dumps(run, indent=2, ensure_ascii=False))

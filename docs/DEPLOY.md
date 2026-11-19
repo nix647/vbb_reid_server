@@ -156,21 +156,21 @@ cd /home/dosomi/dev/vbb_reid_server
   --out /vmdata/vbb_eval/vbb_run/verify/refs.json
 ```
 
-A night that was drawn before a change to `refs.json` keeps the references it was drawn with. Answers live in `marks.json`, with one line per save in `marks.log`, next to each night's `frozen.json`.
+A night that was drawn before a change to `refs.json` keeps the references it was drawn with. Answers live in `marks.json`, with one line per save in `marks.log`, next to each night's `frozen.json`. The same server also shows the correction list's batch review under `/fix` (see below).
 
 ## Learning only from reviewed pictures (0.2.4; on by default since 0.2.5, owner 2026-11-13)
 
-`run` and `shadow` learn only from renamed pictures someone looked at (plan decision 34, `vetting.py`). `--no-label-check` learns from every renamed picture, as before; it exists for the comparison arm of a replay. `scripts/nightly_run.sh` passes `--verify-root $ROOT/verify`, so the owner's check-page answers count too. A picture counts if it carries the backend's `reviewed` mark, or if the owner answered it on the check page. `--verify-root` points at the check page's folder: `refs.json` and each finished night's answers settle the pictures they cover. A reviewed picture teaches the face only if it shows one clear face. Otherwise it only seeds that day's body match. Each run's JSON reports `label_check` counts (`reviewed`, `answered`, `not_reviewed`, `answer_disagrees`, and `no_face` / `two_faces` / `poor_face` for reviewed pictures without a clear face) and lists `disagreements`. Since 0.2.5 they go to the correction list, not the check page (`verify-build --n-check` still adds them on request).
+`run` and `shadow` learn only from renamed pictures someone looked at (plan decision 34, `vetting.py`). `--no-label-check` learns from every renamed picture, as before; it exists for the comparison arm of a replay. `scripts/nightly_run.sh` passes `--verify-root $ROOT/verify`, so the owner's check-page answers count too. A picture counts if it carries the backend's `reviewed` mark, or if the owner answered it on the check page. `--verify-root` points at the check page's folder: `refs.json` and each finished night's answers settle the pictures they cover. A reviewed picture teaches the face only if it shows one clear face. Otherwise it only seeds that day's body match. Each run's JSON reports `label_check` counts (`reviewed`, `answered`, `not_reviewed`, `answer_disagrees`, and `no_face` / `two_faces` / `poor_face` for reviewed pictures without a clear face). A picture where the machine disagrees with a staff name nobody looked at goes to the correction list, never to the check page.
 
 Nothing is marked until the backend release with `reviewed_ids` is deployed and the app's users have a build that sends it. Renames from before count as not reviewed, so until then the job has little to learn from and names few people: expected under the owner's rule. The facility 3 replay compares both arms on an export taken after the app's users have reviewed with the new build. The `reviewed` count in a run with the check on shows how many there are. If that count is missing or zero, the export carries no marks (too early, or its `extras` column is missing): stop, the comparison would show nothing. Use a cache built from the uploaded pictures, as the nightly job's own `emb` is. In a cache built with `--lan-crops` the board's crops replace the uploaded picture, which is the one staff looked at.
 
 There is no separate replay before or after: the owner dropped it (2026-11-13). The nightly check page measures the job as it runs, rule included.
 
-Every confirmed picture is learned from (owner 2026-11-13). That includes a tech-team answer on the check page for a picture no user renamed: the job finds its face in that night's cache. An answer also wins over a rename to someone else that nobody looked at. A run never learns from an answer saved after it started. `refs.json` pictures from before the nightly cache have no face there, and count as `no_face`.
+Every confirmed picture is learned from (owner 2026-11-13). That includes a tech-team answer on the check page, or in the correction list's batch review, for a picture no user renamed: the job finds its face in that night's cache. An answer also wins over a rename to someone else that nobody looked at. A run never learns from an answer saved after it started. `refs.json` pictures from before the nightly cache have no face there, and count as `no_face`.
 
 ## Correction list (0.2.5)
 
-Owner 2026-11-13 (plan decision 35): one list that grows night by night, separate from the check page. `scripts/nightly_run.sh` runs `corrections` after `verify-build`, same skips. It writes `<root>/verify/corrections/list.json`, keyed by sighting id. A picture joins when the machine disagrees with a name nobody confirmed (the board's, or a staff name nobody looked at), and leaves once a person confirms it. The rules are at the top of `corrections.py`. Nothing shows the list yet; how reviewers work through it is a follow-up. The file holds the uploaded picture's link, so it stays on the box like the check page's files.
+Owner 2026-11-13 (plan decision 35): one list that grows night by night, separate from the check page. `scripts/nightly_run.sh` runs `corrections` after `verify-build`, same skips. It writes `<root>/verify/corrections/list.json`, keyed by sighting id. A picture joins when the machine disagrees with a name nobody confirmed (the board's, or a staff name nobody looked at), and leaves once a person confirms it. The rules are at the top of `corrections.py`. Reviewers work through it in batches on the check page's server (next section). The file holds the uploaded picture's link, so it stays on the box like the check page's files.
 
 To look at it on the box:
 
@@ -180,6 +180,17 @@ python3 -c 'import json,collections; d=json.load(open("list.json")); i=d["items"
 ```
 
 It fails if the night's log has no `[corrections]` line, or if `$ROOT/FAILED` gains a `corrections failed` line. When the check page is in use and tonight's wasn't drawn, the log says the list waits; that is not a failure.
+
+## Reviewing the correction list (0.2.6)
+
+Owner 2026-11-19 (plan decision 37). Open `http://localhost:8770/fix` through the same tunnel as the check page; a server started before 0.2.6 must be restarted first. The page lists each person the machine named, with how many pictures wait for review. A batch shows up to 24 of that person's open pictures under their reference pictures (`refs.json`). Tap a picture that isn't that person and say who it is: another person with reference pictures, someone else, or can't tell. Then press Submit, and the next batch loads.
+
+- A picture counts as seen once it has loaded and stayed at least half on screen for 0.6 s, while the tab is visible. Seen and unmarked confirms the machine's name. A picture that never reached the screen records nothing and stays on the list. A mark on an unseen picture is refused.
+- Answers go to `<root>/verify/corrections/answers.json`, with one line per batch in `answers.log`. Only the page server writes them. The nightly `corrections` step reads them and closes each answered picture as `review_right`, `review_wrong` or `review_cant_tell`. Until then an answered picture is hidden from the batches.
+- The job learns from these answers like check-page answers (`vetting.load_trusted`): the person the answer names, from the next run on. Can't tell names nobody.
+- Nothing is written to the backend: the app's names stay as they are. Writing answers back needs a backend route, planned once the list's accuracy is confirmed (owner 2026-11-19).
+- These answers never count toward the check page's accuracy: the list is chosen for disagreeing, not drawn at random.
+- A submitted batch can't be undone from the page.
 
 ## Known gaps
 

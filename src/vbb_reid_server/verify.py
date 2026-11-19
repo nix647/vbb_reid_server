@@ -16,6 +16,9 @@ Three steps, each its own command:
   state or picture links: pictures come through ``/img`` from links in ``frozen.json`` only. Answers
   save to ``marks.json`` (atomic) plus a line in ``marks.log``. Results are shown only for nights
   marked done, so judging the next picture never follows feedback on the last.
+
+The same server shows the correction list's batch review under ``/fix`` (``corrections.py``, plan decision 37).
+Unlike the nightly page it says whom the machine named, by design: a batch asks "are these all this person?".
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ IMAGE_PREFIX = "https://upvbbv.yuexingren.cn/"  # the uploaded pictures; nothing
 OTHER, CANT = "other", "cant_tell"
 MAX_POST = 1 << 20
 NIGHT_RE = re.compile(r"^\d+_\d{4}-\d{2}-\d{2}$")
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")  # a sighting or person id in a /fix path
 
 
 # ------------------------------------------------------------------------ references --
@@ -117,11 +121,9 @@ def _night_run(runs_dir: Path, facility: str, day: str, run_id: str | None):
 
 
 def build_night(runs_dir: Path, refs_path: Path, out_root: Path, facility: str, day: str, *, n: int = 20,
-                n_check: int | None = 0, run_id: str | None = None, log=print) -> Path | None:
-    """``n`` sample items (the machine's new names). Disagreement items (a staff label the machine named someone
-    else for, from the run JSON's ``disagreements``) are added only when asked: at most ``n_check``, ``None`` = all,
-    shuffled in so the reviewer can't tell which is which, and scored apart from the sample. By default there are
-    none: the check page measures, and those pictures go to the correction list (owner 2026-11-13, corrections.py)."""
+                run_id: str | None = None, log=print) -> Path | None:
+    """``n`` sample items: the machine's new names, drawn uniformly. The page only measures: pictures where the
+    machine disagrees with a name nobody confirmed go to the correction list (owner 2026-11-13, corrections.py)."""
     night = out_root / f"{facility}_{day}"
     frozen = night / "frozen.json"
     if frozen.exists():
@@ -145,32 +147,21 @@ def build_night(runs_dir: Path, refs_path: Path, out_root: Path, facility: str, 
             counts[f"{r['state']}/{r['relation']}/{r['via']}"] += 1
     rng = random.Random(f"verify:{facility}:{day}:{meta['run_id']}")
     drawn = rng.sample(pool, min(n, len(pool)))
-    items = [{"kind": "sample", "sighting_id": r["sighting_id"], "url": r["image_url"], "person_id": r["person_id"],
+    items = [{"sighting_id": r["sighting_id"], "url": r["image_url"], "person_id": r["person_id"],
               "via": r["via"], "face_sim": r["face_sim"], "body_sim": r["body_sim"]} for r in drawn]
-    sample_ids = {it["sighting_id"] for it in items}
-    checks = sorted((d for d in meta.get("disagreements") or []
-                     if (d.get("url") or "").startswith(IMAGE_PREFIX) and d["sighting_id"] not in sample_ids),
-                    key=lambda d: d["sighting_id"])
-    picked = checks if n_check is None else rng.sample(checks, min(n_check, len(checks)))
-    items += [{"kind": "check", "sighting_id": d["sighting_id"], "url": d["url"], "person_id": d["machine"],
-               "staff": d.get("staff"), "check": d.get("check", ""), "via": d.get("via", ""),
-               "face_sim": "", "body_sim": ""} for d in picked]
-    if picked:
-        rng.shuffle(items)
     refs = json.loads(Path(refs_path).read_text(encoding="utf-8"))
     data = {
         "facility_id": facility, "day": day, "run_id": meta["run_id"], "model": meta.get("model", ""),
         "drawn_at": int(time.time()), "n": n, "pool": len(pool), "pool_by_via": _by(pool, "via"),
         "counts": dict(sorted(counts.items())), "refs_built_at": refs.get("built_at"), "people": refs["people"],
-        "disagreements": len(checks), "items": items,
+        "items": items,
     }
     night.mkdir(parents=True, exist_ok=True)
     tmp = night / "frozen.json.tmp"
     tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, frozen)
     os.chmod(frozen, 0o444)
-    log(f"[verify] {night.name}: drew {len(drawn)} of {len(pool)} new names and {len(picked)} of {len(checks)} "
-        f"disagreements (run {meta['run_id'][:8]})")
+    log(f"[verify] {night.name}: drew {len(drawn)} of {len(pool)} new names (run {meta['run_id'][:8]})")
     return frozen
 
 
@@ -183,28 +174,18 @@ def _by(rows, field) -> dict[str, int]:
 
 # ------------------------------------------------------------------------ scoring --
 def score_night(frozen: dict, marks: dict) -> dict:
-    """Sample items: right = the answer is the machine's person; wrong = another person, or someone not on the
-    list; can't tell is left out of precision. Disagreement items (``kind == "check"``) never count toward
-    precision: they are tallied in ``checks`` by who the answer sides with."""
+    """Right = the answer is the machine's person; wrong = another person, or someone not on the list; can't tell
+    is left out of precision."""
     by_key = {p["key"]: p["person_id"] for p in frozen["people"]}
     t = {"right": 0, "wrong": 0, "cant_tell": 0, "unanswered": 0}
     per_via: dict[str, list[int]] = defaultdict(lambda: [0, 0])
     per_person: dict[str, list[int]] = defaultdict(lambda: [0, 0])
     wrong = []
     answers = marks.get("answers") or {}
-    checks = {"staff": 0, "machine": 0, "neither": 0, "cant_tell": 0, "unanswered": 0}
-    check_items = []
     for i, it in enumerate(frozen["items"]):
-        a = answers.get(str(i))
-        if it.get("kind") == "check":
-            side = ("unanswered" if a is None else "cant_tell" if a == CANT
-                    else "machine" if by_key.get(a) == it["person_id"]
-                    else "staff" if it.get("staff") is not None and by_key.get(a) == it["staff"] else "neither")
-            checks[side] += 1
-            if side not in ("unanswered", "cant_tell"):
-                check_items.append({"i": i, "answer": a, "side": side, "machine": it["person_id"],
-                                    "staff": it.get("staff"), "check": it.get("check", "")})
+        if it.get("kind") == "check":  # a disagreement an older worker could add (0.2.4-0.2.5 --n-check): not the sample
             continue
+        a = answers.get(str(i))
         if a is None:
             t["unanswered"] += 1
             continue
@@ -218,8 +199,7 @@ def score_night(frozen: dict, marks: dict) -> dict:
         if not ok:
             wrong.append({"i": i, "answer": a, "machine": it["person_id"], "via": it["via"],
                           "face_sim": it["face_sim"], "body_sim": it["body_sim"]})
-    return {**t, "per_via": dict(per_via), "per_person": dict(per_person), "wrong_items": wrong,
-            "checks": checks, "check_items": check_items}
+    return {**t, "per_via": dict(per_via), "per_person": dict(per_person), "wrong_items": wrong}
 
 
 # ------------------------------------------------------------------------ server --
@@ -294,6 +274,32 @@ class Store:
             return None
         return self.fetch(url)
 
+    # the correction list's batch review (corrections.py reads and writes; imported late: it imports this module)
+    def fix_people(self) -> list[dict]:
+        from .corrections import review_people
+        return review_people(self.root)
+
+    def fix_todo(self) -> dict[str, list[dict]]:
+        from .corrections import to_review
+        return to_review(self.root)
+
+    def fix_save(self, machine: str, body) -> dict:
+        from .corrections import save_review
+        return save_review(self.root, machine, body)
+
+    def fix_image(self, sid: str) -> bytes | None:
+        """An open list item's picture; never a held one (it waits, unseen, for its check page)."""
+        from .corrections import open_items
+        url = next((i.get("url") or "" for i in open_items(self.root) if i["sighting_id"] == sid), "")
+        return self.fetch(url) if isinstance(url, str) and url.startswith(IMAGE_PREFIX) else None
+
+    def fix_ref_image(self, ref: int, j: int) -> bytes | None:
+        try:
+            url = self.fix_people()[ref]["photos"][j]["url"]
+        except (IndexError, KeyError, TypeError):
+            return None
+        return self.fetch(url) if isinstance(url, str) and url.startswith(IMAGE_PREFIX) else None
+
 
 def page_data(fz: dict) -> dict:
     """What the reviewer's page receives: labels, names and picture counts. No machine output, no links.
@@ -303,6 +309,25 @@ def page_data(fz: dict) -> dict:
     people = [{"key": p["key"], "name": p.get("name", ""), "photos": len(p["photos"]), "ref": i}
               for i, p in enumerate(fz["people"]) if p["photos"]]
     return {"day": fz["day"], "n": len(fz["items"]), "people": people}
+
+
+def _label(people: list[dict], pid: str) -> str:
+    p = next((p for p in people if str(p.get("person_id")) == pid), None)
+    return p["key"] + (f" · {p['name']}" if p.get("name") else "") if p else "person …" + pid[-6:]
+
+
+def fix_page_data(store: Store, machine: str) -> dict:
+    """What a batch page receives: whom the machine named (its label and reference pictures), the other people
+    one can answer with, and up to ``BATCH`` of its open pictures by id. No links, scores or board names."""
+    from .corrections import BATCH
+    people = store.fix_people()
+    offered = [{"key": p["key"], "name": p.get("name", ""), "photos": len(p["photos"]), "ref": i}
+               for i, p in enumerate(people) if p.get("photos")]
+    me = next((o for o in offered if str(people[o["ref"]]["person_id"]) == machine), None)
+    todo = store.fix_todo().get(machine, [])
+    return {"machine": machine, "label": _label(people, machine), "me": me,
+            "people": [o for o in offered if o is not me], "items": [i["sighting_id"] for i in todo[:BATCH]],
+            "left": len(todo), "batch": BATCH}
 
 
 def make_handler(store: Store):
@@ -341,6 +366,20 @@ def make_handler(store: Store):
                     return self._json(200, store.marks(parts[1]))
                 if len(parts) == 2:
                     return self._send(200, night_html(parts[1], page_data(fz)).encode(), "text/html; charset=utf-8")
+            if parts[0] == "fix" and len(parts) == 1:
+                return self._send(200, fix_index_html(store).encode(), "text/html; charset=utf-8")
+            if parts[0] == "fix" and len(parts) == 3 and parts[1] == "p" and _ID_RE.match(parts[2]):
+                return self._send(200, fix_batch_html(fix_page_data(store, parts[2])).encode(), "text/html; charset=utf-8")
+            if (parts[0] == "fiximg" and len(parts) == 2 and _ID_RE.match(parts[1])) or (
+                    parts[0] == "fixref" and len(parts) == 3 and all(p.isdigit() for p in parts[1:])):
+                try:
+                    data = (store.fix_image(parts[1]) if parts[0] == "fiximg"
+                            else store.fix_ref_image(int(parts[1]), int(parts[2])))
+                except Exception:
+                    return self._send(502, b"picture could not be fetched", "text/plain")
+                if data is None:
+                    return self._send(404, b"no such picture", "text/plain")
+                return self._send(200, data, "image/jpeg", "private, max-age=3600")
             if parts[0] in ("img", "ref") and len(parts) in (3, 4) and all(p.isdigit() for p in parts[2:]):
                 nums = [int(p) for p in parts[2:]]
                 try:
@@ -357,6 +396,15 @@ def make_handler(store: Store):
             if not (self._loopback() and self.headers.get("X-Review") == "1"
                     and (self.headers.get("Content-Type") or "").startswith("application/json")):
                 return self._send(403, b"refused", "text/plain")
+            if len(parts) == 3 and parts[0] == "fix" and parts[1] == "p" and _ID_RE.match(parts[2]):
+                size = int(self.headers.get("Content-Length") or 0)
+                if size > MAX_POST:
+                    return self._send(413, b"too large", "text/plain")
+                try:
+                    out = store.fix_save(parts[2], json.loads(self.rfile.read(size) or b"{}"))
+                except (ValueError, json.JSONDecodeError) as e:
+                    return self._json(400, {"error": str(e)})
+                return self._json(200, out)
             if len(parts) != 3 or parts[0] != "n" or parts[2] != "marks":
                 return self._send(404, b"not found", "text/plain")
             fz = store.frozen(parts[1])
@@ -401,7 +449,6 @@ def _pct(x):
 def index_html(store: Store) -> str:
     e = html.escape
     rows, tot_via, tot_person, wrong_rows = [], defaultdict(lambda: [0, 0]), defaultdict(lambda: [0, 0]), []
-    check_rows = []
     names = {}
     for night in store.nights():
         fz, mk = store.frozen(night), store.marks(night)
@@ -411,10 +458,6 @@ def index_html(store: Store) -> str:
         state = "done" if done else (f"{len(mk.get('answers') or {})} of {len(fz['items'])} answered" if mk.get("answers") else "not started")
         res = (f"<span class=ok>{sc['right']} right</span> · <span class=bad>{sc['wrong']} wrong</span> · "
                f"{sc['cant_tell']} can't tell") if sc else "<span class=muted>shown when done</span>"
-        if sc and any(sc["checks"].values()):
-            c = sc["checks"]
-            res += (f"<br><span class=muted>disagreements: staff {c['staff']} · machine {c['machine']} · "
-                    f"neither {c['neither']} · can't tell {c['cant_tell']}</span>")
         rows.append(f"<tr><td><a href='/n/{e(night)}'>{e(fz['day'])}</a></td><td>{fz['pool']}</td>"
                     f"<td>{sum(1 for it in fz['items'] if it.get('kind') != 'check')}</td><td>{e(state)}</td><td>{res}</td>"
                     f"<td class=muted>{e(mk.get('reviewer') or '')}</td></tr>")
@@ -427,8 +470,6 @@ def index_html(store: Store) -> str:
                 tot_person[p][1] += w
             for x in sc["wrong_items"]:
                 wrong_rows.append((night, fz["day"], x))
-            for x in sc["check_items"]:
-                check_rows.append((night, fz["day"], x))
 
     def tally(d, label):
         out = []
@@ -444,27 +485,18 @@ def index_html(store: Store) -> str:
         f"<td>machine: {e(names.get(x['machine'], x['machine'][-6:]))}<br>answer: {e(x['answer'])}</td>"
         f"<td class=muted>{e(x['via'])} face {e(str(x['face_sim']))} body {e(str(x['body_sim']))}</td></tr>"
         for night, day, x in wrong_rows) or "<tr><td class=muted>none</td></tr>"
-    def who(pid):
-        return "stranger" if pid is None else names.get(pid, pid[-6:])
-    check_html = "".join(
-        f"<tr><td>{e(day)}</td><td><img src='/img/{e(night)}/{x['i']}' style='height:120px'></td>"
-        f"<td>staff: {e(who(x['staff']))}<br>machine: {e(who(x['machine']))}<br>answer: {e(x['answer'])}</td>"
-        f"<td class={'ok' if x['side'] == 'machine' else 'bad' if x['side'] == 'staff' else 'muted'}>"
-        f"{e(x['side'])} right</td></tr>"
-        for night, day, x in check_rows) or "<tr><td class=muted>none</td></tr>"
+    left = sum(len(v) for v in store.fix_todo().values())
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Nightly name check</title>{_STYLE}</head>
 <body><main><h2>Nightly name check</h2>
 <p class=muted>Each night, a random sample of the new names the machine gave (labels are still hidden in the app):
 it measures how often the machine is right.
 Open a night, say who each picture shows, then press "I'm done". Results appear only after that.</p>
+<p><a href='/fix'>Correction list</a>: {left} picture(s) to review.</p>
 <table><tr><th>night</th><th>new names</th><th>sample</th><th>status</th><th>result</th><th>reviewer</th></tr>{''.join(rows)}</table>
 <h3>All finished nights, by how the name was made</h3><table>{head.format('via')}{tally(tot_via, lambda k: k)}</table>
 <h3>By the person the machine named</h3><table>{head.format('person')}{tally(tot_person, lambda k: names.get(k, k[-6:]))}</table>
 <h3>Wrong names</h3><table>{wrong_html}</table>
-<h3>Disagreements decided</h3>
-<p class=muted>Pictures where the machine named someone other than the staff label. Your answer is final: a staff
-label you overruled is never learned from again. It does not change the name in the app.</p><table>{check_html}</table>
 <p class=muted>"At least" is the one-sided 97.5 % lower bound: with 0 wrong it reaches 98 % only after 183 answers.</p>
 </main></body></html>"""
 
@@ -544,4 +576,123 @@ fetch("/n/" + NIGHT + "/marks").then(r => r.json()).then(m => { marks = m; marks
   if (m.submitted) status("This night is marked done; changes still save."); })
   .catch(() => status("Could not load saved answers; reload the page", true));
 show();
+</script></main></body></html>"""
+
+
+def fix_index_html(store: Store) -> str:
+    from .corrections import BATCH, list_summary
+    e = html.escape
+    people = store.fix_people()
+    todo = sorted(store.fix_todo().items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    sm = list_summary(store.root)
+    rows = "".join(f"<tr><td>{e(_label(people, pid))}</td><td>{len(v)}</td><td>{-(-len(v) // BATCH)}</td>"
+                   f"<td><a href='/fix/p/{e(pid)}'>review the next {min(BATCH, len(v))}</a></td></tr>" for pid, v in todo)
+    closed = " · ".join(f"{e(k)} {n}" for k, n in sm["closed"].items()) or "none yet"
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Correction list</title>{_STYLE}</head>
+<body><main><p><a href="/">← nightly name check</a></p><h2>Correction list</h2>
+<p class=muted>Pictures where the machine names someone other than a name nobody confirmed: the camera's, or a
+staff name nobody looked at. A batch shows up to {BATCH} pictures the machine named as one person, under that
+person's reference pictures. Tap any picture that isn't that person and say who it is. A picture you saw and left
+alone confirms the machine's name; one that never reached your screen stays on the list.</p>
+<p class=muted>Answers stay on this box. They close the picture at the next nightly update, and the job learns from
+them. The names in the app don't change. They never count toward the nightly check's accuracy: these pictures are
+chosen for disagreeing, not drawn at random.</p>
+<table><tr><th>the machine says</th><th>to review</th><th>batches</th><th></th></tr>
+{rows or "<tr><td colspan=4 class=muted>nothing to review</td></tr>"}</table>
+<p class=muted>Answered, leaving at the next nightly update: {sm['answered']} · waiting for a check page: {sm['held']}
+· closed so far: {closed}</p>
+</main></body></html>"""
+
+
+def fix_batch_html(data: dict) -> str:
+    return _FIX.replace("__DATA__", _js(data))
+
+
+_FIX = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Correction batch</title>""" + _STYLE + """
+<style>
+.refs{display:flex;gap:6px;align-items:center;overflow-x:auto;border-bottom:1px solid var(--line);padding-bottom:8px}
+.refs img{height:96px;border-radius:4px}
+.grid{display:flex;flex-wrap:wrap;gap:10px;margin:12px 0 96px}
+.tile{width:150px;margin:0;cursor:pointer;border:3px solid transparent;border-radius:8px;padding:2px}
+.tile img{width:100%;height:200px;object-fit:contain;background:#888;border-radius:5px;display:block}
+.tile figcaption{font-size:12px;color:var(--muted);min-height:2.6em}
+.tile.marked{border-color:var(--bad)}.tile.marked figcaption{color:var(--bad)}
+.panel{position:fixed;left:0;right:0;bottom:0;background:var(--card);border-top:1px solid var(--line);padding:10px 16px;max-height:55vh;overflow:auto}
+.panel button{display:flex;gap:6px;align-items:center;width:100%;text-align:left;margin:4px 0;padding:6px 10px;font-size:15px;border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:6px;cursor:pointer}
+.panel button img{height:48px;border-radius:3px}
+.foot{position:fixed;left:0;right:0;bottom:0;background:var(--card);border-top:1px solid var(--line);padding:10px 16px}
+.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+#status.bad{color:var(--bad)}
+</style></head><body><main>
+<div class="bar"><a href="/fix">← correction list</a><b id="title"></b><span id="left" class="muted"></span>
+<label class="muted">Your name <input id="reviewer" maxlength="40" style="width:9em"></label><span id="status" class="muted"></span></div>
+<p class="muted">The machine says every picture below shows <b id="who"></b>. Compare them with the reference
+pictures. Tap a picture that doesn't, and say who it is. Pictures you saw and left alone confirm the name. A
+picture counts as seen once it has loaded and stayed at least half on screen for a moment; the rest stay on the list.</p>
+<div class="refs" id="refs"></div>
+<div class="grid" id="grid"></div>
+<div class="panel" id="panel" hidden><div class="bar"><b id="ptitle"></b><button id="pclose" style="width:auto">close</button></div><div id="pchoices"></div></div>
+<div class="foot" id="foot"><div class="bar"><button id="submit"></button></div></div>
+<script>
+const D = __DATA__;
+const $ = id => document.getElementById(id);
+const marks = {}, seen = new Set(), loaded = new Set(), vis = new Set(), timers = {};
+let open = null, saving = false;
+const label = p => p.key + (p.name ? " · " + p.name : "");
+$("title").textContent = D.label;
+$("who").textContent = D.label;
+$("left").textContent = D.left + " to review for this person";
+function status(t, bad){ $("status").textContent = t; $("status").className = bad ? "bad" : "muted"; }
+if (D.me) { for (let j = 0; j < D.me.photos; j++) { const im = document.createElement("img"); im.src = "/fixref/" + D.me.ref + "/" + j; $("refs").appendChild(im); } }
+else { const m = document.createElement("span"); m.className = "muted"; m.textContent = "No reference pictures for this person."; $("refs").appendChild(m); }
+const choices = D.people.map(p => ({v: p.key, text: "It's " + label(p), p}))
+  .concat([{v: "other", text: "Someone else, or a stranger"}, {v: "cant_tell", text: "Can't tell"}]);
+const answerText = v => { const c = choices.find(c => c.v === v); return c ? c.text : v; };
+function update(){ const marked = Object.keys(marks).length, ok = [...seen].filter(s => !(s in marks)).length;
+  const b = $("submit"); b.disabled = saving || seen.size === 0;
+  b.textContent = "Submit: " + ok + " confirmed · " + marked + " marked · " + (D.items.length - seen.size) + " not seen (stay on the list)"; }
+function caption(tile){ const sid = tile.dataset.sid, c = tile.querySelector("figcaption");
+  tile.classList.toggle("marked", sid in marks);
+  c.textContent = sid in marks ? "Not " + D.label + ": " + answerText(marks[sid]) : (seen.has(sid) ? "seen" : ""); }
+function arm(sid, tile){ if (seen.has(sid) || timers[sid] || !vis.has(sid) || !loaded.has(sid) || document.visibilityState !== "visible") return;
+  timers[sid] = setTimeout(() => { delete timers[sid];
+    if (vis.has(sid) && loaded.has(sid) && document.visibilityState === "visible") { seen.add(sid); caption(tile); update(); } }, 600); }
+const tiles = {};
+const io = new IntersectionObserver(entries => { for (const en of entries) { const sid = en.target.dataset.sid;
+  if (en.intersectionRatio >= 0.5) { vis.add(sid); arm(sid, en.target); }
+  else { vis.delete(sid); clearTimeout(timers[sid]); delete timers[sid]; } } }, {threshold: [0, 0.5, 1]});
+document.addEventListener("visibilitychange", () => { for (const sid of vis) arm(sid, tiles[sid]); });
+D.items.forEach(sid => { const f = document.createElement("figure"); f.className = "tile"; f.dataset.sid = sid;
+  const im = document.createElement("img"); im.alt = "picture";
+  im.onload = () => { loaded.add(sid); arm(sid, f); };
+  im.onerror = () => { f.querySelector("figcaption").textContent = "did not load"; };
+  im.src = "/fiximg/" + encodeURIComponent(sid);
+  f.appendChild(im); f.appendChild(document.createElement("figcaption"));
+  f.onclick = () => pick(sid); tiles[sid] = f; $("grid").appendChild(f); io.observe(f); });
+function pick(sid){ if (!seen.has(sid)) { status("Let the picture show for a moment first", true); return; }
+  open = sid; $("ptitle").textContent = "Not " + D.label + "? Who is it?"; $("pchoices").innerHTML = "";
+  const all = choices.concat(sid in marks ? [{v: null, text: "It is " + D.label + " after all (clear the mark)"}] : []);
+  all.forEach(c => { const b = document.createElement("button"); const t = document.createElement("span"); t.textContent = c.text; b.appendChild(t);
+    if (c.p) for (let j = 0; j < Math.min(3, c.p.photos); j++) { const im = document.createElement("img"); im.src = "/fixref/" + c.p.ref + "/" + j; b.appendChild(im); }
+    b.onclick = () => { if (c.v === null) delete marks[open]; else marks[open] = c.v; caption(tiles[open]); closePanel(); update(); };
+    $("pchoices").appendChild(b); });
+  $("panel").hidden = false; $("foot").hidden = true; }
+function closePanel(){ open = null; $("panel").hidden = true; $("foot").hidden = false; }
+$("pclose").onclick = closePanel;
+$("submit").onclick = async () => { if (saving || seen.size === 0) return; saving = true; update();
+  try { const r = await fetch("/fix/p/" + encodeURIComponent(D.machine), {method: "POST",
+      headers: {"Content-Type": "application/json", "X-Review": "1"},
+      body: JSON.stringify({seen: [...seen], marks: marks, reviewer: $("reviewer").value})});
+    if (!r.ok) throw new Error(await r.text());
+    for (const k of Object.keys(marks)) delete marks[k];
+    status("Saved"); location.reload(); }
+  catch (e) { saving = false; update(); status("Not saved: " + e.message, true); } };
+$("reviewer").onchange = () => { try { localStorage.setItem("reviewer", $("reviewer").value); } catch (e) {} };
+try { $("reviewer").value = localStorage.getItem("reviewer") || ""; } catch (e) {}
+window.addEventListener("beforeunload", ev => { if (Object.keys(marks).length && !saving) { ev.preventDefault(); ev.returnValue = ""; } });
+if (!D.items.length) { const m = document.createElement("p"); m.className = "muted"; m.textContent = "Nothing left to review for this person.";
+  $("grid").appendChild(m); $("foot").hidden = true; }
+update();
 </script></main></body></html>"""

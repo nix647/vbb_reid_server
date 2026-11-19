@@ -203,7 +203,6 @@ def run_night(client: BackendClient, facility_id: int, day: str, *, th: Threshol
         if decided.get("vetting") is not None:
             for st, n in decided["vetting"].counts().items():
                 counts[f"label_check_{st}"] = n
-            counts["disagreements"] = len(local.get("disagreements") or [])
         for r in rows:
             k = f"pushed_{r['relation']}"
             counts[k] = counts.get(k, 0) + 1
