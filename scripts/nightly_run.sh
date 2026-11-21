@@ -3,6 +3,10 @@
 # Labels stay inactive: the worker never activates. Extra arguments go to `run`, so
 #   scripts/nightly_run.sh --day 2026-11-02 --dry-run
 # tests the same path the nightly job uses. On failure it appends a line to $ROOT/FAILED.
+#
+# VBB_RUN_TEST=1 is DHW's test line (plan decision 38, W5): a dry run that reads earlier test runs
+# (--dry-run --earlier-test-runs), then the check page drawn from that dry run (verify-build --test-runs),
+# and no correction list. Nothing is pushed. Install it, with its own ROOT/token/facility, only on the owner's say.
 set -u
 
 CODE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -14,6 +18,13 @@ BACKEND="${VBB_RUN_BACKEND:-https://vbb.yuexingren.cn}"
 TOKEN_FILE="${VBB_RUN_TOKEN_FILE:-$HOME/.config/vbb_reid_server/worker.token}"
 POINT="${VBB_RUN_POINT:-/vmdata/vbb_eval/out/v015/eval_v4_refs50/point_3_temporal.json}"
 MODELS="${VBB_RUN_MODELS:-/vmdata/vbb_eval/models/buffalo_l_face.json}"
+TEST_LINE="${VBB_RUN_TEST:-0}"
+RUN_ARGS=()
+VERIFY_ARGS=()
+if [ "$TEST_LINE" = "1" ]; then
+  RUN_ARGS=(--dry-run --earlier-test-runs)
+  VERIFY_ARGS=(--test-runs)
+fi
 
 # Keep the token, the labels and customers' crops off any proxy the login shell configures.
 BYPASS="vbb.yuexingren.cn,upvbbv.yuexingren.cn"
@@ -38,7 +49,8 @@ cd "$CODE" || exit 1
 timeout --kill-after=5m "$MAX_TIME" "$VENV/bin/vbb-reid-server" run \
   --backend "$BACKEND" --token-file "$TOKEN_FILE" --facility "$FACILITY" --day auto \
   --point "$POINT" --models "$MODELS" \
-  --emb "$ROOT/emb" --cdn-cache "$ROOT/cdn" --out "$ROOT/runs" --verify-root "$ROOT/verify" "$@" >> "$LOG" 2>&1
+  --emb "$ROOT/emb" --cdn-cache "$ROOT/cdn" --out "$ROOT/runs" --verify-root "$ROOT/verify" \
+  ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} "$@" >> "$LOG" 2>&1
 rc=$?
 if [ "$rc" -ne 0 ]; then
   echo "$(date -Iseconds) rc=$rc log=$LOG" >> "$ROOT/FAILED"
@@ -49,14 +61,14 @@ fi
 REFS="${VBB_VERIFY_REFS:-$ROOT/verify/refs.json}"
 if [ "$rc" -eq 0 ] && [ "$#" -eq 0 ] && [ -f "$REFS" ]; then
   "$VENV/bin/vbb-reid-server" verify-build --runs "$ROOT/runs" --refs "$REFS" --out "$ROOT/verify" \
-    --facility "$FACILITY" --day auto >> "$LOG" 2>&1 \
+    --facility "$FACILITY" --day auto ${VERIFY_ARGS[@]+"${VERIFY_ARGS[@]}"} >> "$LOG" 2>&1 \
     || echo "$(date -Iseconds) verify-build failed log=$LOG" >> "$ROOT/FAILED"
 fi
 
 # Correction list (owner 2026-11-13, corrections.py): tonight's pictures the machine names differently from a name
 # nobody confirmed. After the check page, so tonight's sample stays off the list until it's answered; when the
 # check page is in use and wasn't drawn, the list waits for it. Same skips as the check page, same failure record.
-if [ "$rc" -eq 0 ] && [ "$#" -eq 0 ]; then
+if [ "$rc" -eq 0 ] && [ "$#" -eq 0 ] && [ "$TEST_LINE" != "1" ]; then
   "$VENV/bin/vbb-reid-server" corrections --runs "$ROOT/runs" --verify-root "$ROOT/verify" \
     --facility "$FACILITY" --day auto >> "$LOG" 2>&1 \
     || echo "$(date -Iseconds) corrections failed log=$LOG" >> "$ROOT/FAILED"

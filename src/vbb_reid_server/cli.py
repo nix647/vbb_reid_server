@@ -266,6 +266,7 @@ def cmd_run(args) -> None:
     import signal
     from .api import BackendClient
     from .crops import CropStore
+    from .regroup_inputs import EarlierPolicy
     from .run import Guards, run_night
     try:
         client = BackendClient(args.backend, _read_token(args.token_file))
@@ -293,8 +294,10 @@ def cmd_run(args) -> None:
         try:
             run_night(client, int(args.facility), day, th=th, quality=quality, policy=policy, emb_root=args.emb,
                       out_dir=args.out, models=models, face_id=face_id, body_id=body_id, store=store,
-                      tz_name=args.tz, dry_run=args.dry_run, guards=Guards(max_promote_share=args.max_promote_share), keep_crops=args.keep_crops,
-                      vet=_vet(args), verify_root=getattr(args, "verify_root", None))
+                      tz_name=args.tz, dry_run=args.dry_run, guards=Guards(max_promote_share=args.max_promote_share),
+                      keep_crops=args.keep_crops, vet=_vet(args), verify_root=getattr(args, "verify_root", None),
+                      earlier=EarlierPolicy(nights=getattr(args, "earlier_nights", 7),
+                                            test_runs=getattr(args, "earlier_test_runs", False)))
         except Exception as e:  # one bad day must not stop the rest of a range; never echo the token
             print(f"[run] {args.facility} {day}: FAILED: {client.redact(f'{e.__class__.__name__}: {e}')}",
                   file=sys.stderr)
@@ -372,12 +375,39 @@ def cmd_prune(args) -> None:
     print(f"[prune] removed {n_c} cached crops, {n_e} embedding files older than {args.days} days")
 
 
+def _refs_export(args):  # -> (export, answers given directly, backend context or None)
+    """The export the reference pictures are picked from: the offline SQL export, or (``--from-backend``) the backend's
+    own references over the reference window, with its staff labels that carry the reviewed mark as the answers."""
+    if not args.from_backend:
+        if not args.export or not args.answers:
+            raise SystemExit("verify-refs needs --export and --answers, or --from-backend")
+        return load_export(args.export, args.aliases), {}, None
+    from .api import BackendClient, BackendError, export_from_backend
+    from .pipeline import RefPolicy
+    from .verify import reviewed_staff_answers
+    if not args.backend or not args.token_file:
+        raise SystemExit("--from-backend needs --backend and --token-file")
+    days = _run_days(args)
+    if len(days) != 1:
+        raise SystemExit("--from-backend takes one --day")
+    try:
+        client = BackendClient(args.backend, _read_token(args.token_file))
+    except ValueError as e:  # the message never contains the token
+        raise SystemExit(str(e)) from None
+    window = args.window_days if args.window_days is not None else RefPolicy().window_days
+    try:
+        ex = export_from_backend(client, int(args.facility), days[0], window_days=window, tz_name=args.tz)
+    except BackendError as e:
+        raise SystemExit(client.redact(f"{e.__class__.__name__}: {e}")) from None
+    return ex, reviewed_staff_answers(ex, str(args.facility)), (client, days[0])
+
+
 def cmd_verify_refs(args) -> None:
     import numpy as np
 
     from .embed import load_face
-    from .verify import pick_references
-    ex = load_export(args.export, args.aliases)
+    from .verify import add_board_references, pick_references
+    ex, given, backend = _refs_export(args)
     face_id = _ids_from_cache(args.emb, "face", args.face_model)
     tables: dict = {}
 
@@ -389,13 +419,37 @@ def cmd_verify_refs(args) -> None:
         rows = np.flatnonzero((t.sighting_id == s.sighting_id) & (t.crop_idx == 0))
         return len(rows) > 0 and all(t.n_faces[i] == 1 and t.second_ratio[i] == 0 for i in rows)
 
-    refs = pick_references(ex, args.facility, [Path(f) for f in args.answers], one_face=one_face,
-                           exclude=set(args.exclude or []), per_person=args.per_person)
+    def face_norm(sid: str, day: str):  # the cached face's raw feature norm: how good the face is
+        k = (str(args.facility), day)
+        if k not in tables:
+            tables[k] = load_face(Path(args.emb), face_id, *k)
+        t = tables[k]
+        rows = np.flatnonzero((t.sighting_id == sid) & (t.crop_idx == 0))
+        return float(t.norm[rows[0]]) if len(rows) else None
+
+    refs = pick_references(ex, args.facility, [Path(f) for f in args.answers or []], one_face=one_face,
+                           exclude=set(args.exclude or []), per_person=args.per_person, answers=given)
+    if backend is not None:  # people nobody confirmed get pictures under the board's name, marked unconfirmed
+        from datetime import date, timedelta
+
+        from .api import BackendError
+        client, day = backend
+        pulled = {}
+        for k in range(args.board_days):
+            d = (date.fromisoformat(day) - timedelta(days=k)).isoformat()
+            try:
+                pulled[d] = client.pull_sightings(int(args.facility), d)[0]
+            except (BackendError, OSError, ValueError) as e:
+                print(f"[verify-refs] skipped {d}: could not pull it ({client.redact(str(e))})")
+        add_board_references(refs, ex, str(args.facility), pulled, one_face=one_face, quality=face_norm,
+                             per_person=args.per_person)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(refs, indent=1, ensure_ascii=False), encoding="utf-8")
     for p in refs["people"]:
-        print(f"[verify-refs] {p['key']}: {len(p['photos'])} picture(s) over {len({x['day'] for x in p['photos']})} day(s)")
+        board = sum(1 for x in p["photos"] if not x.get("confirmed", True))
+        print(f"[verify-refs] {p['key']}: {len(p['photos'])} picture(s) over {len({x['day'] for x in p['photos']})} day(s)"
+              + (", all the board's name, not confirmed" if board else ""))
     print(f"[verify-refs] dropped: {refs['dropped']}\n[verify-refs] written to {out}")
 
 
@@ -403,7 +457,7 @@ def cmd_verify_build(args) -> None:
     from .verify import build_night
     for day in _run_days(args):
         build_night(Path(args.runs), Path(args.refs), Path(args.out), str(args.facility), day, n=args.n,
-                    run_id=args.run_id)
+                    run_id=args.run_id, test_runs=getattr(args, "test_runs", False))
 
 
 def cmd_corrections(args) -> None:
@@ -499,8 +553,8 @@ def build_parser() -> argparse.ArgumentParser:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    def common(sp, emb=True):
-        sp.add_argument("--export", required=True, help="folder with the export CSVs")
+    def common(sp, emb=True, export_required=True):
+        sp.add_argument("--export", required=export_required, help="folder with the export CSVs")
         sp.add_argument("--aliases", help="person_id,human[,name] CSV (same human across facilities)")
         if emb:
             sp.add_argument("--emb", required=True, help="embedding cache root")
@@ -605,6 +659,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="guard: promotions / sightings above this are reported as a guard failure (the worker never "
                          "activates; activation is on the app host)")
     sp.add_argument("--keep-crops", action="store_true", help="keep the downloaded crops (debugging)")
+    sp.add_argument("--earlier-nights", type=int, default=7,
+                    help="top up people with few pictures tonight from the earlier nights' names of the nightly job "
+                         "(look back this many nights; 0 = off)")
+    sp.add_argument("--earlier-test-runs", action="store_true",
+                    help="also read dry runs as earlier nights (DHW's test line, where every run is a dry run)")
     sp.add_argument("--label-check", nargs="?", const="default", default="default",
                     help="learn only from renamed pictures someone looked at (vetting.py, owner 2026-11-11/12): on by "
                          "default; optional JSON of VetPolicy overrides")
@@ -672,11 +731,24 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(fn=cmd_inspect)
 
     sp = sub.add_parser("verify-refs", help="reference pictures per person for the verification page (once)")
-    common(sp)
+    common(sp, export_required=False)
     sp.add_argument("--facility", required=True)
     sp.add_argument("--face-model", required=True, help="cached face model (slug or substring), for the one-face check")
-    sp.add_argument("--answers", nargs="+", required=True,
-                    help="answers given one picture at a time: adjudication CSVs or a review page's marks.json")
+    sp.add_argument("--answers", nargs="+",
+                    help="answers given one picture at a time: adjudication CSVs or a review page's marks.json "
+                         "(needed with --export, not with --from-backend)")
+    sp.add_argument("--from-backend", action="store_true",
+                    help="pick from the backend instead of --export/--answers: its staff labels with the reviewed mark "
+                         "are the answers (DHW has no offline export)")
+    sp.add_argument("--backend", help="with --from-backend: device backend base URL")
+    sp.add_argument("--token-file", help="with --from-backend: the worker token file (mode 600)")
+    sp.add_argument("--day", default="auto", help="with --from-backend: the day the reference window ends on")
+    sp.add_argument("--tz", default="Asia/Shanghai", help="with --from-backend: the facility's time zone")
+    sp.add_argument("--window-days", type=int,
+                    help="with --from-backend: how far back to look (default: the run's reference window, 60)")
+    sp.add_argument("--board-days", type=int, default=14,
+                    help="with --from-backend: a person with no confirmed picture gets the board's own pictures of "
+                         "them from this many days up to --day (default 14: the face cache's retention)")
     sp.add_argument("--exclude", nargs="*", help="sighting ids never to show as a reference")
     sp.add_argument("--per-person", type=int, default=6)
     sp.add_argument("--out", required=True, help="refs.json")
@@ -691,6 +763,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--tz", default="Asia/Shanghai")
     sp.add_argument("--n", type=int, default=20)
     sp.add_argument("--run-id", help="this run instead of the newest non-dry one (one day only)")
+    sp.add_argument("--test-runs", action="store_true",
+                    help="draw from the newest DRY run of the night (DHW's test line) instead of the newest real one")
     sp.set_defaults(fn=cmd_verify_build)
 
     sp = sub.add_parser("corrections", help="add a night to the correction list (nightly, after verify-build)")

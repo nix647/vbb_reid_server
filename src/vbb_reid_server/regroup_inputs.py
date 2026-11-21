@@ -28,7 +28,8 @@ from .vetting import VetPolicy, clear_crop
 class EarlierPolicy:
     nights: int = 7  # look back this many nights before the probe night; 0 = off
     top_up: int = 30  # a person with fewer pictures than this tonight is topped up to it
-    namers: tuple[str, ...] = ("decide",)  # whose label files may be read (E6)
+    namers: tuple[str, ...] = ("decide", "regroup")  # whose label files may be read (E6)
+    test_runs: bool = False  # E1: also read dry runs (DHW's test line)
     min_checked: int = 5  # E5: a person's earlier names need this many human-checked pictures ...
     max_disagree: float = 0.2  # ... and are not used when more than this share of them disagree
 
@@ -46,7 +47,7 @@ class EarlierPolicy:
 @dataclass(frozen=True)
 class NightReport:
     day: str
-    status: str  # "used" | "no_run" | "no_labels" | "namer" | "no_faces"
+    status: str  # "used" | "no_run" | "no_labels" | "namer" | "no_faces" | "no_overlays"
     face_names: int  # face names left after E2 and E3 (roster and the skips), before the top-up limit
     added: int  # pictures this night contributed
 
@@ -70,11 +71,12 @@ def usable_faces(ft, ref_policy: RefPolicy, vet: VetPolicy) -> dict[str, tuple[n
     return out
 
 
-def night_run(runs_dir: str | Path, facility: str, day: str,
-              namers: Iterable[str] | None = None) -> tuple[dict, Path] | None:
+def night_run(runs_dir: str | Path, facility: str, day: str, namers: Iterable[str] | None = None,
+              test_runs: bool = False) -> tuple[dict, Path] | None:
     """The night's real run record and the path of its labels file (which may not exist), or None. Real = ``dry_run``
-    exactly false; with ``namers``, also a ``namer`` (absent = "decide") among them, checked before the latest is
-    chosen; the latest ``started_at`` wins; a record that cannot be read is skipped."""
+    exactly false (with ``test_runs``, exactly true counts too); with ``namers``, also a ``namer`` (absent =
+    "decide") among them, checked before the latest is chosen; the latest ``started_at`` wins; a record that cannot
+    be read is skipped."""
     namers = None if namers is None else tuple(namers)
     runs_dir = Path(runs_dir)
     found = []
@@ -83,7 +85,8 @@ def night_run(runs_dir: str | Path, facility: str, day: str,
             rec = json.loads(f.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if not isinstance(rec, dict) or rec.get("dry_run") is not False:
+        real = isinstance(rec, dict) and (rec.get("dry_run") is False or (test_runs and rec.get("dry_run") is True))
+        if not real:
             continue
         if namers is not None and rec.get("namer", "decide") not in namers:
             continue
@@ -140,10 +143,11 @@ def _face_names(rows: list[dict], key: Callable, roster: set[str]) -> list[tuple
 def earlier_items(*, facility: str, day: str, runs_dir: str | Path, face_table: Callable, key: Callable,
                   roster: Iterable[str], tonight: Iterable[Item], confirmed: Mapping[str, str | None],
                   touched: Iterable[str], capture_ts: Mapping[str, int] | None = None,
-                  policy: EarlierPolicy = EarlierPolicy(), ref_policy: RefPolicy = RefPolicy(),
+                  skip_days: Iterable[str] = (), policy: EarlierPolicy = EarlierPolicy(),
+                  ref_policy: RefPolicy = RefPolicy(),
                   vet: VetPolicy = VetPolicy()) -> tuple[list[Item], EarlierReport]:
     """The earlier nights' face names of the nightly job, as weak ``Item``s for the people thin tonight (E1-E7)."""
-    roster, touched, tonight = set(roster), set(touched), list(tonight)
+    roster, touched, tonight, skip_days = set(roster), set(touched), list(tonight), set(skip_days)
     capture_ts = capture_ts or {}
     in_tonight = {it.sid for it in tonight}
     d0 = date.fromisoformat(day)
@@ -153,10 +157,13 @@ def earlier_items(*, facility: str, day: str, runs_dir: str | Path, face_table: 
     seen: set[str] = set()
     for back in range(1, policy.nights + 1):  # never the probe night itself or later
         d = (d0 - timedelta(days=back)).isoformat()
-        run = night_run(runs_dir, facility, d, policy.namers)  # E6: only an accepted namer's runs are candidates
         names, faces, status = [], {}, "used"
+        if d in skip_days:  # the caller could not pull this night's overlays: fail closed, read nothing of it
+            nights.append((d, "no_overlays", names, faces))
+            continue
+        run = night_run(runs_dir, facility, d, policy.namers, policy.test_runs)  # E6: accepted namers' runs only
         if run is None:  # real runs that only other namers made are "namer", no real run at all is "no_run"
-            status = "no_run" if night_run(runs_dir, facility, d) is None else "namer"
+            status = "no_run" if night_run(runs_dir, facility, d, None, policy.test_runs) is None else "namer"
         elif not run[1].is_file():
             status = "no_labels"
         else:

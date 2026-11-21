@@ -207,10 +207,10 @@ def _probe(sid, t, **kw):
     return row
 
 
-def _ref(sid, pid, t, *, facility=3, day="2026-10-18", corrected=None):
+def _ref(sid, pid, t, *, facility=3, day="2026-10-18", corrected=None, reviewed=False):
     return {"sighting_id": sid, "facility_id": facility, "person_id": pid, "did": "45",
             "image_url": f"https://cdn.example/{sid}.jpg", "crop_is_face": True, "capture_ts": t,
-            "corrected_ts": corrected or t + 3_600_000, "day": day}
+            "corrected_ts": corrected or t + 3_600_000, "day": day, "reviewed": reviewed}
 
 
 ROSTER = [{"person_id": "pA", "person_type": "visitor", "role": None, "merged_into": None, "tentative": False},
@@ -316,23 +316,25 @@ NOW = ms(2026, 10, 21, 2, 30)
 
 
 def _night(tmp_path, *, reject=None):
-    """pA and pB have 4 labeled references each on 10-18. The probe day holds: q1 (pA's face, board
-    unsure -> promote), q2 (pA's face, already human-labeled -> decided, never pushed), q3 (a face
-    like nobody -> abstain)."""
+    """pA and pB have 35 confirmed pictures each on 10-18 (the reviewed mark: the sorter's anchors; 35 so that
+    each person's bar has 30 impostor pictures to stand on). The probe day holds: q1 (pA's face, board unsure
+    -> promote), q2 (pA's face, already human-labeled -> sorted, never pushed), q3 (a face like nobody ->
+    no name)."""
     rng = np.random.default_rng(1)
     refs, cache_ref = [], []
     for who, axis in (("pA", 0), ("pB", 1)):
-        for i in range(4):
+        for i in range(35):
             sid = f"r{who}{i}"
-            refs.append(_ref(sid, who, ms(2026, 10, 18, 9 + i)))
+            refs.append(_ref(sid, who, ms(2026, 10, 18, 9) + i * 1000, reviewed=True))
             cache_ref.append((sid, 0, near(basis(axis), 0.05, rng), 0.9, 80.0))
     write_face_cache(tmp_path / "emb", "3", "2026-10-18", cache_ref)
     sightings = [_probe("q1", ms(2026, 10, 20, 9)), _probe("q2", ms(2026, 10, 20, 10), human_labeled=True,
                                                          human_state="stranger"),
                  _probe("q3", ms(2026, 10, 20, 11))]
+    nobody = -(basis(0) + basis(1)) / np.sqrt(2)  # a face unlike both people
     write_face_cache(tmp_path / "emb", "3", DAY, [("q1", 0, near(basis(0), 0.05, rng), 0.9, 80.0),
                                                   ("q2", 0, near(basis(0), 0.05, rng), 0.9, 80.0),
-                                                  ("q3", 0, near(basis(5), 0.05, rng), 0.9, 80.0)])
+                                                  ("q3", 0, near(nobody, 0.05, rng), 0.9, 80.0)])
     return FakeBackend(sightings, refs, ROSTER, reject=reject)
 
 

@@ -1,14 +1,17 @@
-"""The production run for one facility-day (Phase B): pull → embed → decide → register → push → finish.
+"""The production run for one facility-day (Phase B): pull → embed → sort → register → push → finish.
 
-Same decision code as the offline shadow (``shadow.decide_night``); what differs is where the data
-comes from (the ``/worker/*`` API, ``api.export_from_backend``) and where the labels go (the backend,
-inactive until activated). The local CSV/JSON of every run are written as in shadow, so a run can be
-audited and scored with the Phase A tools.
+The nightly namer is the sorter (``regroup_night``, plan decision 38): it starts from the board's names and the
+human confirmations that exist when the run starts and names each picture only when it clearly fits one person; a
+machine name that differs from the board's goes out as a name (relation ``relabel``). What differs from the offline
+tools is where the data comes from (the ``/worker/*`` API, ``api.export_from_backend``) and where the labels go
+(the backend, inactive until activated). The local CSV/JSON of every run are written as the offline shadow writes
+them, so a run can be audited and scored with the same tools; ``decide.py`` and ``shadow.decide_night`` stay for
+those offline tools and no longer name anything here.
 
 Rules this module owns:
-- References are the labels that exist when the run starts (``label_cutoff_ms`` = start time) and,
-  as in production's references/pull, only those of this facility's roster (``RefPolicy.roster_only``).
-- A sighting with ANY human overlay (known, stranger, or reset to pending) is decided for the local
+- The human checks are the ones that exist when the run starts (``label_cutoff_ms`` = start time) and, as in
+  production's references/pull, only those of this facility's roster.
+- A sighting with ANY human overlay (known, stranger, or reset to pending) is sorted for the local
   file but never pushed.
 - Register comes after the decision, so the lease covers only push and finish (minutes), not the
   embedding of a cold cache. Once register has been attempted the run is always finished: ``done`` on
@@ -17,10 +20,10 @@ Rules this module owns:
 - The worker never activates. Activation lives on the app host (owner 2026-11-05: manual through the
   trial, automatic with guards after the Phase B gate); the guards are computed here and reported in
   the run's ``counts`` (``guard_failures``) for that step to read.
-- With ``vet`` given, staff labels are learned from only where someone looked at the picture
-  (``vetting``, owner 2026-11-11/12); your check-page answers under ``verify_root`` settle the
-  pictures they cover. Off unless asked.
-- Relabels are flags in v1 whatever the operating point says (``allow_relabel`` forced off).
+- A staff name counts as a human check only with the reviewed mark (owner 2026-11-11/12); your check-page
+  answers under ``verify_root`` settle the pictures they cover. ``vet`` supplies the clear-face rule.
+- The run record carries ``"namer": "regroup"`` and a ``"regroup"`` summary; the earlier nights are read back from
+  such records (``regroup_inputs``).
 - Embedding: only what the cache lacks, face only for references (their body vectors are never read),
   never days after the probe day.
 - Crops downloaded for the run are deleted when it ends, and leftovers older than a day (from a run
@@ -36,14 +39,18 @@ import time
 import uuid
 from collections import Counter
 from dataclasses import asdict, dataclass, replace
+from datetime import date, timedelta
 from pathlib import Path
 
 from . import __version__
 from .api import PAGE, BackendClient, BackendError, export_from_backend
 from .decide import MachineLabel, Thresholds
-from .pipeline import RefPolicy, Workspace
+from .pipeline import RefPolicy, Refs, Workspace
 from .quality import QualityPolicy
-from .shadow import decide_night, shadow_run
+from .regroup import Params
+from .regroup_inputs import EarlierPolicy
+from .regroup_night import regroup_night
+from .shadow import shadow_run
 from .vetting import load_trusted
 
 
@@ -159,6 +166,7 @@ def run_night(client: BackendClient, facility_id: int, day: str, *, th: Threshol
               face_id: str | None = None, body_id: str | None = None, store=None,
               tz_name: str = "Asia/Shanghai", dry_run: bool = False, guards: Guards = Guards(),
               keep_crops: bool = False, worker_id: str | None = None, vet=None, verify_root=None,
+              earlier: EarlierPolicy = EarlierPolicy(), params: Params = Params(),
               now_ms=lambda: int(time.time() * 1000), log=print) -> dict:
     """``models``: a loaded model set (embeds what the cache lacks); ``None`` = use the cache only,
     with ``face_id`` / ``body_id`` naming the cached models (tests, re-runs)."""
@@ -167,13 +175,13 @@ def run_night(client: BackendClient, facility_id: int, day: str, *, th: Threshol
     if not face_id:
         raise ValueError("no face model: pass a model set or a cached face_id")
     policy = replace(policy, include_same_day=True, roster_only=True)
-    th = replace(th, allow_relabel=False)
     fac = str(facility_id)
     run_id = uuid.uuid4().hex
     started = now_ms()
     model_id = model_id_of(face_id, body_id)
     worker_id = worker_id or socket.gethostname()[:64]
     thresholds = _clean({**th.as_dict(), "ref_policy": asdict(policy), "quality": asdict(quality),
+                         "namer": "regroup", "regroup": asdict(params), "earlier": asdict(earlier),
                          **({"label_check": asdict(vet)} if vet is not None else {})})
     attempted = False
     summary: dict = {"run_id": run_id, "facility_id": fac, "day": day, "dry_run": dry_run, "model_id": model_id}
@@ -181,28 +189,33 @@ def run_night(client: BackendClient, facility_id: int, day: str, *, th: Threshol
         ex = export_from_backend(client, facility_id, day, window_days=policy.window_days, tz_name=tz_name)
         n_probe = len(ex.by_facility_day(fac, day))
         log(f"[run] {fac} {day}: {n_probe} sightings, {sum(1 for s in ex.sightings if s.human_state == 'known')} "
-            f"human-labeled references in the window, roster {len(ex.roster_ids(fac))}")
+            f"human-labeled pictures in the window, roster {len(ex.roster_ids(fac))}")
         counts: dict[str, int] = {"sightings": n_probe}
         if models is not None:
             counts.update(embed_missing(ex, fac, day, models, store, emb_root, log=log))
         ws = Workspace(ex, emb_root, face_id, body_id, quality)
-        trusted = load_trusted(verify_root) if vet is not None else None
-        decided = decide_night(ws, fac, day, th, policy, label_cutoff_ms=started, vet=vet, trusted=trusted)
+        trusted = load_trusted(verify_root) if verify_root is not None else None
+        overlays = {}  # the earlier nights' current overlays; a failed pull is None and that night is left out
+        d0 = date.fromisoformat(day)
+        for back in range(1, earlier.nights + 1):
+            d = (d0 - timedelta(days=back)).isoformat()
+            try:
+                overlays[d] = client.pull_sightings(facility_id, d)[0]
+            except (BackendError, OSError, ValueError) as e:
+                log(f"[run] {fac} {day}: could not pull {d} for the earlier nights: {client.redact(str(e))}")
+                overlays[d] = None
+        sorted_ = regroup_night(ws, fac, day, label_cutoff_ms=started, ref_policy=policy, vet=vet, trusted=trusted,
+                                runs_dir=out_dir, overlays=overlays, earlier=earlier, params=params)
+        decided = {"labels": sorted_["labels"], "sightings": sorted_["sightings"], "refs": Refs({}), "seeds": {},
+                   "vetting": None}
+        summary_regroup = _clean(sorted_["summary"])
         local = shadow_run(ws, fac, day, th, out_dir, policy=policy, label_cutoff_ms=started,
                            model_name=model_id, run_id=run_id, decided=decided,
-                           extra={"dry_run": dry_run}, vet=vet, log=log)
+                           extra={"dry_run": dry_run, "namer": "regroup", "regroup": summary_regroup}, vet=vet, log=log)
         by_sid = {s.sighting_id: s for s in decided["sightings"]}
         keep = [l for l in decided["labels"] if not by_sid[l.sighting_id].has_overlay]
         rows = [label_row(l) for l in keep]
-        refs = decided["refs"]
-        thin = {l.person_key: refs.n_sightings(l.person_key) if l.person_key in refs else 0
-                for l in keep if l.state == "known" and l.person_key is not None
-                and (l.person_key not in refs or refs.n_sightings(l.person_key) < th.min_refs)}
-        counts.update(labels=len(rows), references=sum(refs.n_sightings(k) for k in refs),
-                      references_people=len(refs))
-        if decided.get("vetting") is not None:
-            for st, n in decided["vetting"].counts().items():
-                counts[f"label_check_{st}"] = n
+        counts.update(labels=len(rows), earlier_added=sum(sorted_["earlier"].added.values()))
         for r in rows:
             k = f"pushed_{r['relation']}"
             counts[k] = counts.get(k, 0) + 1
@@ -220,10 +233,9 @@ def run_night(client: BackendClient, facility_id: int, day: str, *, th: Threshol
         for reason, n in rejected.items():
             counts[f"rejected_{reason}"] = n
         crop_stats = dict(store.stats) if store is not None and getattr(store, "stats", None) else None
-        failures = guard_failures(counts, rejected, n_probe, guards, thin_people=thin, min_refs=th.min_refs,
-                                  crop_stats=crop_stats)
+        failures = guard_failures(counts, rejected, n_probe, guards, crop_stats=crop_stats)
         counts["guard_failures"] = len(failures)
-        summary.update(counts=counts, guard_failures=failures, local=local)
+        summary.update(counts=counts, guard_failures=failures, local=local, regroup=summary_regroup)
         if dry_run:
             log(f"[run] {fac} {day}: dry run, nothing pushed: {counts}")
             return summary

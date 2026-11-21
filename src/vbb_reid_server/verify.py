@@ -34,6 +34,7 @@ import urllib.request
 from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 from .metrics import cp_lower
 
@@ -54,19 +55,30 @@ def read_any_answers(path: Path) -> dict[str, str]:
     return read_answers(path)
 
 
+def reviewed_staff_answers(ex, facility: str) -> dict[str, str]:
+    """sid -> the key of the person a staff ``known`` label names, for the labels someone looked at (the reviewed
+    mark). The backend export has no one-at-a-time answer files; these stand in for them (DHW, W7)."""
+    return {s.sighting_id: ex.key(s.human_person_id) for s in ex.sightings
+            if s.facility_id == facility and s.human_state == "known" and s.human_reviewed
+            and ex.key(s.human_person_id) is not None}
+
+
 def pick_references(ex, facility: str, answer_files: list[Path], *, one_face, exclude: set[str],
-                    per_person: int = 6, seed: int = 1) -> dict:
+                    per_person: int = 6, seed: int = 1, answers: dict[str, str] | None = None) -> dict:
     """``one_face(sighting) -> bool``: the uploaded picture shows exactly one face. Answers are identity
-    keys (the alias file's H1..); a picture with two different answers across files is dropped."""
+    keys (the alias file's H1..); a picture with two different answers across files is dropped. ``answers``:
+    more answers (sid -> key) given directly, counted like a file's."""
     roster = ex.roster(facility)  # key -> this facility's person_id
-    answers: dict[str, set[str]] = defaultdict(set)
+    answers_of: dict[str, set[str]] = defaultdict(set)
     for f in answer_files:
         for sid, a in read_any_answers(Path(f)).items():
-            answers[sid].add(a)
+            answers_of[sid].add(a)
+    for sid, a in (answers or {}).items():
+        answers_of[sid].add(a)
     by_id = {s.sighting_id: s for s in ex.sightings}
     pool: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
     dropped: dict[str, int] = defaultdict(int)
-    for sid, given in sorted(answers.items()):
+    for sid, given in sorted(answers_of.items()):
         s = by_id.get(sid)
         why = None
         if len(given) != 1:
@@ -96,21 +108,71 @@ def pick_references(ex, facility: str, answer_files: list[Path], *, one_face, ex
             for d in days:  # one per day in turn, so a reviewer doesn't learn one outfit
                 if pool[key][d] and len(photos) < per_person:
                     s = pool[key][d].pop()
-                    photos.append({"sighting_id": s.sighting_id, "day": s.day, "url": s.image_url})
+                    photos.append({"sighting_id": s.sighting_id, "day": s.day, "url": s.image_url, "confirmed": True})
         people.append({"person_id": roster[key], "key": key, "name": ex.names.get(key, ""), "photos": photos})
     return {"facility_id": facility, "built_at": int(time.time()), "per_person": per_person,
             "dropped": dict(sorted(dropped.items())), "people": people}
 
 
+def unconfirmed_photos(person: dict) -> list[int]:
+    """Indexes of a person's reference photos that are the board's name and not confirmed (a photo without the flag
+    is confirmed, as in every file written before the flag existed)."""
+    return [j for j, ph in enumerate(person.get("photos") or []) if not ph.get("confirmed", True)]
+
+
+def add_board_references(refs: dict, ex, facility: str, pulled: dict[str, list[dict]], *, one_face, quality,
+                         per_person: int = 6) -> dict:
+    """A roster person with no confirmed reference picture gets up to ``per_person`` pictures under the BOARD's name
+    (W8): sightings the board named that person, with no human overlay of any kind, an uploaded picture and exactly
+    one face, best face quality first, one per day in turn. Each carries ``confirmed: false``. ``pulled``: day ->
+    that day's sighting rows from the backend (a day whose pull failed is simply absent). ``quality(sid, day)`` is
+    the cached face's raw norm (None ranks last). The sorter's names are never used."""
+    roster = ex.roster(facility)
+    pool: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    dropped: dict[str, int] = defaultdict(int)
+    for day, rows in sorted(pulled.items()):
+        for r in rows:
+            sid = str(r.get("sighting_id"))
+            if r.get("board_state") != "known" or not r.get("board_person_id"):
+                continue
+            key = ex.key(str(r["board_person_id"]))
+            if key not in roster:
+                dropped["not a roster person"] += 1
+            elif r.get("human_labeled") or r.get("human_state"):
+                dropped["has a human overlay"] += 1
+            elif not str(r.get("image_url") or "").startswith(IMAGE_PREFIX):
+                dropped["no uploaded picture"] += 1
+            elif not one_face(SimpleNamespace(facility_id=facility, day=day, sighting_id=sid)):
+                dropped["not exactly one face"] += 1
+            else:
+                q = quality(sid, day)
+                pool[key][day].append((float("-inf") if q is None or q != q else q, sid, r["image_url"]))
+    for p in refs["people"]:
+        if p["photos"]:  # someone confirmed this person: the board's pictures are not needed
+            continue
+        days = sorted(pool.get(p["key"], {}))
+        for d in days:
+            pool[p["key"]][d].sort(key=lambda t: (-t[0], t[1]))  # best face first
+        days.sort(key=lambda d: (-pool[p["key"]][d][0][0], d))  # the day of the best picture first
+        while len(p["photos"]) < per_person and any(pool[p["key"]][d] for d in days):
+            for d in days:
+                if pool[p["key"]][d] and len(p["photos"]) < per_person:
+                    _, sid, url = pool[p["key"]][d].pop(0)
+                    p["photos"].append({"sighting_id": sid, "day": d, "url": url, "confirmed": False})
+    refs["board"] = {"days": sorted(pulled), "dropped": dict(sorted(dropped.items()))}
+    return refs
+
+
 # ------------------------------------------------------------------------ nightly draw --
-def _night_run(runs_dir: Path, facility: str, day: str, run_id: str | None):
-    """The labels CSV and run JSON of the newest finished, non-dry run of the night (or ``run_id``)."""
+def _night_run(runs_dir: Path, facility: str, day: str, run_id: str | None, test_runs: bool = False):
+    """The labels CSV and run JSON of the newest finished, non-dry run of the night (or ``run_id``); with
+    ``test_runs`` the newest DRY run instead (DHW's nightly test line)."""
     best = None
     for rj in runs_dir.glob(f"run_{facility}_{day}_*.json"):
         meta = json.loads(rj.read_text(encoding="utf-8"))
         if run_id is not None and meta.get("run_id") != run_id:
             continue
-        if run_id is None and meta.get("dry_run") is not False:  # older files lack the marker: skipped
+        if run_id is None and meta.get("dry_run") is not (True if test_runs else False):  # older files: skipped
             continue
         if best is None or meta.get("finished_at", 0) > best[1].get("finished_at", 0):
             best = (rj, meta)
@@ -121,24 +183,25 @@ def _night_run(runs_dir: Path, facility: str, day: str, run_id: str | None):
 
 
 def build_night(runs_dir: Path, refs_path: Path, out_root: Path, facility: str, day: str, *, n: int = 20,
-                run_id: str | None = None, log=print) -> Path | None:
-    """``n`` sample items: the machine's new names, drawn uniformly. The page only measures: pictures where the
+                run_id: str | None = None, test_runs: bool = False, log=print) -> Path | None:
+    """``n`` sample items: the machine's names that differ from the board's (new names and corrections), drawn
+    uniformly. The page only measures: pictures where the
     machine disagrees with a name nobody confirmed go to the correction list (owner 2026-11-13, corrections.py)."""
     night = out_root / f"{facility}_{day}"
     frozen = night / "frozen.json"
     if frozen.exists():
         log(f"[verify] {night.name}: already drawn, nothing changed")
         return frozen
-    found = _night_run(Path(runs_dir), facility, day, run_id)
+    found = _night_run(Path(runs_dir), facility, day, run_id, test_runs)
     if found is None:
-        log(f"[verify] {facility} {day}: no finished non-dry run in {runs_dir}")
+        log(f"[verify] {facility} {day}: no finished {'dry' if test_runs else 'non-dry'} run in {runs_dir}")
         return None
     labels_csv, meta = found
     with labels_csv.open(newline="", encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
     if rows and "image_url" not in rows[0]:
         raise SystemExit(f"{labels_csv} has no image_url column (written before 0.2.3); draw a later night")
-    pool = sorted((r for r in rows if r["state"] == "known" and r["relation"] == "promote"
+    pool = sorted((r for r in rows if r["state"] == "known" and r["relation"] in ("promote", "relabel")
                    and r["human_labeled"] in ("0", "") and r["image_url"].startswith(IMAGE_PREFIX)),
                   key=lambda r: r["sighting_id"])
     counts: dict[str, int] = defaultdict(int)
@@ -306,8 +369,8 @@ def page_data(fz: dict) -> dict:
     Only people with reference pictures are offered: one nobody can recognise is no use as a choice, and a
     person without a single labeled picture has no references, so the machine cannot name them either.
     ``ref`` keeps the person's place in ``frozen.json`` for ``/ref/<night>/<ref>/<j>``."""
-    people = [{"key": p["key"], "name": p.get("name", ""), "photos": len(p["photos"]), "ref": i}
-              for i, p in enumerate(fz["people"]) if p["photos"]]
+    people = [{"key": p["key"], "name": p.get("name", ""), "photos": len(p["photos"]), "ref": i,
+               "unconf": unconfirmed_photos(p)} for i, p in enumerate(fz["people"]) if p["photos"]]
     return {"day": fz["day"], "n": len(fz["items"]), "people": people}
 
 
@@ -321,8 +384,8 @@ def fix_page_data(store: Store, machine: str) -> dict:
     one can answer with, and up to ``BATCH`` of its open pictures by id. No links, scores or board names."""
     from .corrections import BATCH
     people = store.fix_people()
-    offered = [{"key": p["key"], "name": p.get("name", ""), "photos": len(p["photos"]), "ref": i}
-               for i, p in enumerate(people) if p.get("photos")]
+    offered = [{"key": p["key"], "name": p.get("name", ""), "photos": len(p["photos"]), "ref": i,
+                "unconf": unconfirmed_photos(p)} for i, p in enumerate(people) if p.get("photos")]
     me = next((o for o in offered if str(people[o["ref"]]["person_id"]) == machine), None)
     todo = store.fix_todo().get(machine, [])
     return {"machine": machine, "label": _label(people, machine), "me": me,
@@ -432,13 +495,14 @@ def serve(root: Path, port: int, log=print) -> None:
 
 # ------------------------------------------------------------------------ pages --
 _STYLE = """<style>
-:root{--bg:#fafafa;--fg:#1c1c1c;--muted:#666;--line:#ddd;--card:#fff;--accent:#2563eb;--bad:#b91c1c;--ok:#15803d}
-@media (prefers-color-scheme: dark){:root{--bg:#141414;--fg:#eee;--muted:#aaa;--line:#333;--card:#1e1e1e;--accent:#60a5fa;--bad:#f87171;--ok:#4ade80}}
+:root{--bg:#fafafa;--fg:#1c1c1c;--muted:#666;--line:#ddd;--card:#fff;--accent:#2563eb;--bad:#b91c1c;--ok:#15803d;--warn:#b45309}
+@media (prefers-color-scheme: dark){:root{--bg:#141414;--fg:#eee;--muted:#aaa;--line:#333;--card:#1e1e1e;--accent:#60a5fa;--bad:#f87171;--ok:#4ade80;--warn:#fbbf24}}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,sans-serif}
 main{max-width:1100px;margin:0 auto;padding:12px 16px}
 table{border-collapse:collapse;margin:8px 0 16px}td,th{border-bottom:1px solid var(--line);padding:4px 10px;text-align:left}
 .muted{color:var(--muted);font-size:13px}.bad{color:var(--bad)}.ok{color:var(--ok)}
 a{color:var(--accent)}
+img.unconf{outline:3px solid var(--warn);outline-offset:1px}.unconf-note{color:var(--warn);font-size:12px;white-space:nowrap}
 </style>"""
 
 
@@ -529,6 +593,7 @@ for the main one. Keys: 1–9 pick a person, o = someone else, x = can't tell, �
 <div class="bar"><button id="prev">← Back</button><button id="next">Next →</button><button id="done">I'm done</button></div>
 <script>
 const D = __DATA__, NIGHT = __NIGHT__;
+const NOTE = "board's name, not confirmed";  // a reference picture the board named: nobody checked it
 let marks = {answers:{}, seen:[], failed:[], submitted:false, reviewer:""}, loaded = false, cur = 0, timer = null, pending = false;
 const seen = new Set(), failed = new Set();
 const $ = id => document.getElementById(id);
@@ -537,7 +602,9 @@ const choices = D.people.map((p, i) => ({v: p.key, label: (i + 1) + ". " + p.key
   .concat([{v: "other", label: "o. Stranger or someone else"}, {v: "cant_tell", label: "x. Can't tell"}]);
 D.people.forEach((p, i) => { const row = document.createElement("div"); row.className = "ref";
   const b = document.createElement("b"); b.textContent = (i + 1) + ". " + p.key + (p.name ? " · " + p.name : ""); row.appendChild(b);
-  for (let j = 0; j < p.photos; j++) { const im = document.createElement("img"); im.loading = "lazy"; im.src = "/ref/" + NIGHT + "/" + p.ref + "/" + j; row.appendChild(im); }
+  for (let j = 0; j < p.photos; j++) { const im = document.createElement("img"); im.loading = "lazy"; im.src = "/ref/" + NIGHT + "/" + p.ref + "/" + j;
+    if ((p.unconf || []).includes(j)) { im.className = "unconf"; im.title = NOTE; } row.appendChild(im); }
+  if ((p.unconf || []).length) { const n = document.createElement("span"); n.className = "unconf-note"; n.textContent = NOTE; row.appendChild(n); }
   $("refs").appendChild(row); });
 choices.forEach(c => { const b = document.createElement("button"); b.textContent = c.label; b.dataset.v = c.v;
   b.onclick = () => { b.blur(); answer(c.v); }; $("choices").appendChild(b); });  // blur: Enter must not repeat it
@@ -637,6 +704,7 @@ picture counts as seen once it has loaded and stayed at least half on screen for
 <div class="foot" id="foot"><div class="bar"><button id="submit"></button></div></div>
 <script>
 const D = __DATA__;
+const NOTE = "board's name, not confirmed";  // a reference picture the board named: nobody checked it
 const $ = id => document.getElementById(id);
 const marks = {}, seen = new Set(), loaded = new Set(), vis = new Set(), timers = {};
 let open = null, saving = false;
@@ -645,7 +713,9 @@ $("title").textContent = D.label;
 $("who").textContent = D.label;
 $("left").textContent = D.left + " to review for this person";
 function status(t, bad){ $("status").textContent = t; $("status").className = bad ? "bad" : "muted"; }
-if (D.me) { for (let j = 0; j < D.me.photos; j++) { const im = document.createElement("img"); im.src = "/fixref/" + D.me.ref + "/" + j; $("refs").appendChild(im); } }
+if (D.me) { for (let j = 0; j < D.me.photos; j++) { const im = document.createElement("img"); im.src = "/fixref/" + D.me.ref + "/" + j;
+    if ((D.me.unconf || []).includes(j)) { im.className = "unconf"; im.title = NOTE; } $("refs").appendChild(im); }
+  if ((D.me.unconf || []).length) { const n = document.createElement("span"); n.className = "unconf-note"; n.textContent = NOTE; $("refs").appendChild(n); } }
 else { const m = document.createElement("span"); m.className = "muted"; m.textContent = "No reference pictures for this person."; $("refs").appendChild(m); }
 const choices = D.people.map(p => ({v: p.key, text: "It's " + label(p), p}))
   .concat([{v: "other", text: "Someone else, or a stranger"}, {v: "cant_tell", text: "Can't tell"}]);
@@ -675,7 +745,8 @@ function pick(sid){ if (!seen.has(sid)) { status("Let the picture show for a mom
   open = sid; $("ptitle").textContent = "Not " + D.label + "? Who is it?"; $("pchoices").innerHTML = "";
   const all = choices.concat(sid in marks ? [{v: null, text: "It is " + D.label + " after all (clear the mark)"}] : []);
   all.forEach(c => { const b = document.createElement("button"); const t = document.createElement("span"); t.textContent = c.text; b.appendChild(t);
-    if (c.p) for (let j = 0; j < Math.min(3, c.p.photos); j++) { const im = document.createElement("img"); im.src = "/fixref/" + c.p.ref + "/" + j; b.appendChild(im); }
+    if (c.p) for (let j = 0; j < Math.min(3, c.p.photos); j++) { const im = document.createElement("img"); im.src = "/fixref/" + c.p.ref + "/" + j;
+      if ((c.p.unconf || []).includes(j)) { im.className = "unconf"; im.title = NOTE; } b.appendChild(im); }
     b.onclick = () => { if (c.v === null) delete marks[open]; else marks[open] = c.v; caption(tiles[open]); closePanel(); update(); };
     $("pchoices").appendChild(b); });
   $("panel").hidden = false; $("foot").hidden = true; }

@@ -31,9 +31,11 @@ Four safeguards the owner agreed to:
 4. **"Fits" is set per site from that site's own pictures**, never carried over from another site.
 
 And one rule of hygiene: the sort is redone from scratch every night from the board's names, the human
-confirmations and, for people with too few pictures tonight, the earlier nights' face names of the nightly job
-("Earlier nights"). It never reads its own earlier output, so a mistake cannot feed on itself: those earlier names
-come from the job that learns only from humans (guard E6).
+confirmations and, for people with too few pictures tonight, the face names the nightly machine gave earlier
+nights' pictures ("Earlier nights"; owner 2026-11-21: "a picture belongs to someone, and it was decided already").
+Once the sorter is the nightly job (plan decision 38), those are its own earlier names. They enter only as weak
+names: re-judged every night, never above a human, and a person whose machine names disagree with human answers
+is not topped up (E5).
 
 ## Terms
 
@@ -175,8 +177,10 @@ and strictly more than any other group got. Then every group gets its label:
   blended into it. The obvious fix, refuting a pile that not one of its person's confirmed pictures chose, was built
   and measured: 2 more right names on the six office-linaro nights, but 10 fewer on the simulated quiet nights with
   the top-up (114 → 104), because a topped-up pile is tight and its person's hard confirmed pictures never look
-  typical of it. Reverted. A better test would judge the confirmed pictures by quality class, as the bars do (F5).
-  Refuting whenever the votes fell short of a home was worse still: 32 fewer right names and 6 more wrong.
+  typical of it. Reverted. Refuting whenever the votes fell short of a home was worse still: 32 fewer right names
+  and 6 more wrong. Judging each confirmed picture's vote within its quality class (hard against the pile's hard
+  pictures, as the bars do in F5) was tried too, 2026-11-21: alone it changed no home and no score at either site;
+  with the refuting rule the quiet nights still fell (114 → 109). Not adopted.
 
 **Own groups.** A person with anchors and no group labelled with exactly their name (a disputed set that contains
 their name does not count) gets a group of their own when they have at least `min_anchors` anchors, or when their
@@ -348,14 +352,15 @@ pulled from the backend.
 class EarlierPolicy:
     nights: int = 7                       # look back this many nights before the probe night; 0 = off
     top_up: int = 30                      # a person with fewer pictures than this tonight is topped up to it
-    namers: tuple[str, ...] = ("decide",) # whose label files may be read (E6)
+    namers: tuple[str, ...] = ("decide", "regroup")  # whose label files may be read (E6)
+    test_runs: bool = False               # E1: also read dry runs (DHW's test line, W5)
     min_checked: int = 5                  # E5: a person's earlier names need this many human-checked pictures...
     max_disagree: float = 0.2             # ...and are not used when more than this share of them disagree
 
 @dataclass(frozen=True)
 class NightReport:
     day: str
-    status: str            # "used" | "no_run" | "no_labels" | "namer" | "no_faces"
+    status: str            # "used" | "no_run" | "no_labels" | "namer" | "no_faces" | "no_overlays"
     face_names: int        # face names read from the night's labels file (after E1-E3)
     added: int             # pictures this night contributed
 
@@ -369,16 +374,17 @@ class EarlierReport:
 def usable_faces(ft, ref_policy, vet) -> dict[str, tuple[np.ndarray, float]]
 def night_run(runs_dir, facility, day) -> tuple[dict, Path] | None
 def earlier_items(*, facility, day, runs_dir, face_table, key, roster, tonight, confirmed, touched,
-                  capture_ts=None, policy=EarlierPolicy(), ref_policy=RefPolicy(), vet=VetPolicy())
+                  capture_ts=None, skip_days=(), policy=EarlierPolicy(), ref_policy=RefPolicy(), vet=VetPolicy())
                   -> tuple[list[Item], EarlierReport]
 ```
 
 - `usable_faces`: per sighting, the **first row of the table** (table order) that is a clear crop (`vetting.clear_crop`)
   and usable as a reference (`pipeline.ref_usable`): its vector and its raw feature norm (the face quality). The same
   rule makes every face the sorter sees, tonight's included.
-- `night_run(runs_dir, facility, day, namers=None)`: the night's real run: `run_<facility>_<day>_*.json` with
-  `dry_run` exactly `false`, and, when `namers` is given, a `namer` (absent = `"decide"`) among them; the latest
-  `started_at` among those, and its labels file `labels_<same tag>.csv`. A record that cannot be read is skipped;
+- `night_run(runs_dir, facility, day, namers=None, test_runs=False)`: the night's real run:
+  `run_<facility>_<day>_*.json` with `dry_run` exactly `false` (with `test_runs`, `true` counts too), and, when
+  `namers` is given, a `namer` (absent = `"decide"`) among them; the latest `started_at` among those, and its
+  labels file `labels_<same tag>.csv`. A record that cannot be read is skipped;
   none left = `None`. (The namer is checked before the latest run is chosen, so a later sorter run of a night never
   hides that night's decide run.)
 - `earlier_items` inputs: `face_table(facility, day)` returns that night's face table (`Workspace.face_table`);
@@ -393,6 +399,7 @@ def earlier_items(*, facility, day, runs_dir, face_table, key, roster, tonight, 
 - E1. **Nights**: the `nights` calendar days before `day`, newest first. Never `day` itself or later. A night
   without a real run, without its labels file, or whose face table is empty or cannot be read (missing, unreadable,
   or stored in an older cache format: `embed.StaleCache`) contributes nothing; its `NightReport.status` says why.
+  A night in `skip_days` (the caller could not pull its current overlays) is not read at all: `"no_overlays"`.
   Keep `nights` well inside the face cache's retention (14 days, decision 14).
 - E2. **Face names only**: rows with `state == "known"`, `via == "face"` and a person id. A clothes name is
   same-day evidence and says nothing about the face.
@@ -411,39 +418,111 @@ def earlier_items(*, facility, day, runs_dir, face_table, key, roster, tonight, 
   `dropped`. (office-linaro, 11-13..18: 59 checked, 0 disagree.)
 - E6. **Provenance**: a labels file is read only when its run record's `namer` (absent = `"decide"`, every run so
   far) is in `namers`. Among a night's real runs, only those with an accepted namer are candidates, and the latest of
-  them is used; a night whose real runs all have other namers has the status `"namer"`. Wiring the sorter into
-  `run` (#119) must write `"namer": "regroup"` into the records of runs whose names it gave; reading those back is a
-  decision for then.
+  them is used; a night whose real runs all have other namers has the status `"namer"`. Since plan decision 38 the
+  sorter's own runs (`"namer": "regroup"`, W3) are read by default; another namer is refused.
 - E7. **Deterministic**: the same files and inputs give the same items in the same order. A labels row that cannot
   be read is skipped, not fatal.
 
 **Obligations for the caller (#119, when this is wired into `run`).** The module trusts what it is given, so:
 
 - `touched` must come from a fresh pull of each earlier night (`BackendClient.pull_sightings`), because a labels
-  file only knows the overlays as of its own night. **Fail closed**: a night whose pull failed is left out of the
-  look-back entirely (pass a shorter window, or drop its names), never read with an empty `touched`, which would let
-  pictures staff rejected come back as weak names.
+  file only knows the overlays as of its own night. **Fail closed**: a night whose pull failed goes in `skip_days`,
+  never read with an empty `touched`, which would let pictures staff rejected come back as weak names.
 - `confirmed` must hold every human check the run knows: reviewed staff labels and every check-page answer,
   "not on the list" included, and the correction list's verdicts too (a picture someone marked wrong must never
   come back under that name). Those verdicts are chosen for disagreeing, so they make the drift check (E5) stricter
   than a random sample would: it can only stop a top-up, never cause a wrong name. A picture answered "can't tell"
   is a human check as well: pass it in `touched`.
 - `capture_ts` comes from the same pulls.
-- Runs whose names come from the sorter write `"namer": "regroup"` into their run record (E6). If the sorter
-  replaces decide as the night's namer, #119 must also decide how decide's names stay readable (E1 reads real runs
-  only, and pushing two sets of names is not an option), or allow reading the sorter's own names; otherwise the
-  top-up dries up `nights` days after wiring.
+- Runs whose names come from the sorter write `"namer": "regroup"` into their run record (E6, W3).
 - A face-model upgrade or a face-cache format change leaves the earlier nights without usable cached faces: the
   top-up then stops (`no_faces`) until those nights are embedded again in full (`run.embed_missing` re-embeds only
   the days holding references, and only those pictures). Check the night reports after an upgrade.
+
+## Wiring into the nightly run (#119) and DHW test runs (#99)
+
+Plan decision 38 (owner, 2026-11-21): the sorter replaces the old decision path in the nightly run ("we don't need 2
+systems"), corrections of the board's names included; DHW gets nightly test runs "for me to judge". The backend
+already accepts a machine name that corrects the board (`MachineLabelHelper.php:905`, relation `relabel`) and shows
+it over the board's name (`IdentityResolver.php:49`), so no backend change is needed; rows stay inactive until
+activated, as now.
+
+- **W1. One namer.** `run` names with the sorter only; it no longer calls `decide_night`. `decide.py` stays for the
+  offline tools (`eval`, `shadow`, the adjudication pages), which measure the old path.
+- **W2. `src/vbb_reid_server/regroup_night.py`**, the inputs and the rows for one facility-night:
+
+  ```python
+  def regroup_night(ws, facility, day, *, label_cutoff_ms, ref_policy, vet, trusted, runs_dir,
+                    overlays: Mapping[str, list[dict] | None], earlier=EarlierPolicy(), params=Params()) -> dict
+      # -> {"labels": [MachineLabel], "sightings": [probe Sighting], "result": Result, "earlier": EarlierReport,
+      #     "summary": dict}
+  ```
+
+  - Probes: every sighting of the facility-night. Face: `usable_faces` of that night's table (vector and norm as
+    the quality). Body: the night's body vector (`Workspace.probe_inputs`).
+  - **Anchor** of a picture, the human check that existed before `label_cutoff_ms`: a check-page or
+    correction-list answer (`trusted`, saved before the cutoff per `Trusted.info`) naming a person on the roster;
+    otherwise a staff `known` label with the reviewed mark, `corrected_ts` before the cutoff, person on the roster.
+    An answer of "not on the list" gives no anchor, and that picture gets no machine row.
+  - **Weak name** of a probe without an anchor: a staff `known` label without the reviewed mark (person on the
+    roster), else the board's `known` name (on the roster), else none.
+  - **Earlier confirmed pictures**: sightings of the facility before `day`, within `ref_policy.window_days`, with an
+    anchor by the same rule (the export's references, and answers found through `Trusted.info`); face from their own
+    night's table; not probes, no body.
+  - **Earlier nights**: `earlier_items` with `confirmed` = every human check (all answers, "not on the list"
+    included, and reviewed staff labels), `touched` = pictures with any overlay in `overlays[night]` plus pictures
+    answered "can't tell", `skip_days` = nights whose `overlays` entry is `None`, `capture_ts` from `overlays`.
+  - **Rows**: one per probe whose answer names a person (via face or body), never one for an unnamed probe:
+    `MachineLabel(state="known", relation=` `"agree"` when the board's `known` name is that person, `"relabel"` when
+    it is someone else, else `"promote"` `, person_key=key, person_id=` the facility's id for that key `, via=` the
+    answer's via `, confidence=score, margin=None, face_sim=` score when via face `, body_sim=` score when via body
+    `, evidence={"reason", "floor", "others"})`. A probe with a human overlay gets its row in the file like any other;
+    the run never pushes it (unchanged rule of `run.py`).
+- **W3. `run_night`.** Pulls each earlier night of the look-back (`BackendClient.pull_sightings`; a failed pull is
+  `None`), calls `regroup_night`, and pushes relabels as names: the forcing of `allow_relabel` off goes. It writes
+  the same files as now (labels CSV with the same columns, `label_check` empty; staff CSV; run JSON). The run JSON
+  gets `"namer": "regroup"` and a `"regroup"` summary: counts by reason and via; per face group its members, floors
+  and whether active; disputes, dissolved, displaced, refuted; the earlier-nights report. Guards kept: rejected rows,
+  promotion share, crop failures, empty run. The thin-references guard goes (it measured the old path's references).
+- **W4. Check page.** `verify-build` draws from every `known` row whose relation is `promote` or `relabel` (the
+  machine's names that differ from the board) with no human label, so it measures the corrections too. With
+  `--test-runs` it reads the newest dry run of the night (DHW).
+- **W5. DHW test line.** `scripts/nightly_run.sh` with `VBB_RUN_TEST=1` passes `--dry-run --earlier-test-runs` to
+  `run`, then still draws the check page (`verify-build --test-runs`) and skips the correction list. DHW settings:
+  facility 5, root `/vmdata/vbb_eval/vbb_run_f5`, token `~/.config/vbb_reid_server/worker_f5.token`, the same point
+  and models files as office-linaro; 01:30 Taiwan; `refs.json` built once with `verify-refs` for facility 5; its page
+  server on port 8771, loopback only. Installing the line and the page server is the owner's call.
+- **W6. `run` options.** `--earlier-nights N` (default 7, 0 = off) and `--earlier-test-runs`.
+- **W7. Reference pictures for a check page from the backend** (DHW has no offline export and no one-at-a-time
+  answers). `verify-refs --from-backend` (with `--backend`, `--token-file`, `--facility`, `--day`, `--emb`,
+  `--face-model`, `--per-person`, `--out`) builds `refs.json` from `export_from_backend` over the reference window:
+  every staff `known` label with the reviewed mark counts as an answer for its person, with the same checks and the
+  same per-person draw as `pick_references` (one face in the uploaded picture, an uploaded image, a roster person,
+  one picture per day in turn). `--answers` is then not needed. The backend sends no names, so the page shows each
+  person's id with their reference pictures. (Checked 2026-11-21: the existing builder reads only the offline SQL
+  export and answer files, so DHW's page could not be built.)
+- **W8. Board-named references for people nobody confirmed** (owner, 2026-11-21: "for other people who don't have
+  confirmed pics, can we just pick high quality sightings as reference? Probably mark them as unconfirmed, say, a
+  colored box"). With `--from-backend`, a roster person who gets no confirmed reference picture gets up to
+  `per_person` pictures under the **board's** name instead, never the sorter's (the page measures the sorter, and its
+  own names as references would let it grade itself):
+  - candidates: the facility's sightings of the last `--board-days` days (default 14, the face cache's retention),
+    pulled with `pull_sightings`, whose board name is that person, with no human overlay of any kind, an uploaded
+    picture, and exactly one face (the same one-face check);
+  - ranked by face quality (the raw feature norm of the cached face), best first; one picture per day in turn, as
+    for confirmed references;
+  - each such picture carries `"confirmed": false` in `refs.json` (confirmed pictures carry `true`; a picture without
+    the field counts as confirmed, as every existing file does);
+  - the check page and the correction list's batch view show them in a colored frame with the note "board's name,
+    not confirmed".
+  - **Never an answer**: `vetting.load_trusted` reads only confirmed pictures of `refs.json` as answers. A picture
+    with `"confirmed": false` must never become a human check, an anchor or ground truth.
 
 ## What this does not do yet
 
 - Suggesting a new person from a tight group of unnamed pictures.
 - Using "two people in one frame are different people".
-- Any change to `run`, `decide`, the check page or the correction list. Nothing calls `regroup_inputs` yet but
-  the evaluation.
-- Earlier nights for clothes (clothes change from day to day) or for DHW (no nightly job runs there yet).
+- Earlier nights for clothes (clothes change from day to day).
 
 ## Evaluation before wiring
 

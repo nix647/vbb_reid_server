@@ -195,7 +195,7 @@ def test_zero_nights_reads_nothing(w):
 def test_a_night_says_why_it_contributes_nothing(w):
     w.night("2026-11-14", [("14-a1", "A")], dry=True)  # only a dry run
     w.night("2026-11-13", [("13-a1", "A")], labels=False)  # no labels file
-    w.night("2026-11-12", [("12-a1", "A")], namer="regroup")  # not a namer we read
+    w.night("2026-11-12", [("12-a1", "A")], namer="someone-else")  # not a namer we read
     w.night("2026-11-11", [("11-a1", "A")], faces=False)  # no face cache: the table call raises
     w.night("2026-11-10", [("10-a1", "A")])
     items, rep = w.run(policy=EarlierPolicy(nights=6, top_up=10))
@@ -411,12 +411,16 @@ def test_a_run_record_without_a_namer_counts_as_decide(w):
     assert rep.nights[0].status == "used" and sids(items) == ["s1"]
 
 
-def test_a_regroup_namer_is_refused_by_default_and_read_when_the_policy_allows_it(w):
+def test_the_sorters_own_runs_are_read_by_default_and_an_unknown_namer_is_refused(w):
+    assert EarlierPolicy().namers == ("decide", "regroup") and EarlierPolicy().test_runs is False
     w.night("2026-11-14", [("s1", "A")], namer="regroup")
     items, rep = w.run(policy=EarlierPolicy(nights=1, top_up=10))
-    assert items == [] and rep.nights[0].status == "namer"
-    items, rep = w.run(policy=EarlierPolicy(nights=1, top_up=10, namers=("decide", "regroup")))
     assert sids(items) == ["s1"] and rep.nights[0].status == "used"
+    items, rep = w.run(policy=EarlierPolicy(nights=1, top_up=10, namers=("decide",)))
+    assert items == [] and rep.nights[0].status == "namer"
+    w.night("2026-11-13", [("s2", "A")], namer="someone-else")
+    items, rep = w.run(policy=EarlierPolicy(nights=2, top_up=10))
+    assert [(n.day[-2:], n.status) for n in rep.nights] == [("14", "used"), ("13", "namer")]
 
 
 # E7: deterministic ------------------------------------------------------------------------------------------------
@@ -485,20 +489,59 @@ def test_night_run_with_namers_takes_the_latest_run_of_an_accepted_namer(w):
     assert night_run(w.runs, FAC, "2026-11-14", ("someone-else",)) is None
 
 
-def test_a_later_sorter_run_of_a_night_does_not_hide_the_decide_run(w):
+def test_a_later_run_of_another_namer_does_not_hide_an_accepted_run(w):
     w.night("2026-11-14", [("dec-1", "A")], tag="dec00000", started=5)
     w.night("2026-11-14", [("reg-1", "A")], tag="reg00000", started=9, namer="regroup")
+    items, rep = w.run(policy=EarlierPolicy(nights=1, top_up=10, namers=("decide",)))
+    assert sids(items) == ["dec-1"] and rep.nights[0].status == "used"  # the later sorter run is not accepted here
     items, rep = w.run(policy=EarlierPolicy(nights=1, top_up=10))
-    assert sids(items) == ["dec-1"] and rep.nights[0].status == "used"
+    assert sids(items) == ["reg-1"]  # by default both are accepted and the latest wins
     items, rep = w.run(policy=EarlierPolicy(nights=1, top_up=10, namers=("regroup",)))
     assert sids(items) == ["reg-1"]
 
 
 def test_the_status_is_namer_only_when_the_night_has_real_runs_but_none_with_an_accepted_namer(w):
-    w.night("2026-11-14", [("s1", "A")], tag="reg00000", namer="regroup")
-    w.night("2026-11-13", [("s2", "A")], tag="dry00000", namer="regroup", dry=True)  # a dry run is no real run
+    w.night("2026-11-14", [("s1", "A")], tag="reg00000", namer="other")
+    w.night("2026-11-13", [("s2", "A")], tag="dry00000", namer="other", dry=True)  # a dry run is no real run
     w.night("2026-11-12", [("s3", "A")], tag="dec00000", dry=True)
-    w.night("2026-11-12", [("s4", "A")], tag="reg00001", namer="regroup")
+    w.night("2026-11-12", [("s4", "A")], tag="reg00001", namer="other")
     items, rep = w.run(policy=EarlierPolicy(nights=3, top_up=10))
     assert [(n.day[-2:], n.status) for n in rep.nights] == [("14", "namer"), ("13", "no_run"), ("12", "namer")]
     assert items == []
+
+
+def test_night_run_counts_a_dry_run_only_when_test_runs_is_asked_for(w):
+    w.night("2026-11-14", [], tag="real0000", started=5)
+    w.night("2026-11-14", [], tag="test0000", started=9, dry=True)
+    assert night_run(w.runs, FAC, "2026-11-14")[0]["run_id"] == "real0000"
+    assert night_run(w.runs, FAC, "2026-11-14", None, True)[0]["run_id"] == "test0000"  # the latest of both kinds
+    only_dry = w.runs / f"run_{FAC}_2026-11-13_dry00000.json"
+    only_dry.write_text(json.dumps({"run_id": "dry00000", "dry_run": True, "started_at": 1}))
+    assert night_run(w.runs, FAC, "2026-11-13") is None
+    assert night_run(w.runs, FAC, "2026-11-13", None, True)[0]["run_id"] == "dry00000"
+    only_dry.write_text(json.dumps({"run_id": "dry00000", "started_at": 1}))  # dry_run missing: never a run
+    assert night_run(w.runs, FAC, "2026-11-13", None, True) is None
+
+
+def test_a_dry_run_night_is_read_only_with_test_runs(w):
+    w.night("2026-11-14", [("t1", "A")], dry=True)
+    items, rep = w.run(policy=EarlierPolicy(nights=1, top_up=10))
+    assert items == [] and rep.nights[0].status == "no_run"
+    items, rep = w.run(policy=EarlierPolicy(nights=1, top_up=10, test_runs=True))
+    assert sids(items) == ["t1"] and rep.nights[0].status == "used"
+
+
+def test_a_night_whose_overlays_could_not_be_pulled_is_not_read_at_all(w):
+    w.night("2026-11-14", [("a1", "A")])
+    w.night("2026-11-13", [("b1", "A")])
+    items, rep = w.run(skip_days={"2026-11-14"}, policy=EarlierPolicy(nights=2, top_up=10))
+    assert [(n.day[-2:], n.status, n.face_names, n.added) for n in rep.nights] == [("14", "no_overlays", 0, 0),
+                                                                                  ("13", "used", 1, 1)]
+    assert sids(items) == ["b1"] and w.table_calls == ["2026-11-13"]  # no face table, no labels read for 14
+    assert rep.checked == {} and rep.dropped == ()
+
+
+def test_skip_days_defaults_to_nothing_skipped(w):
+    w.night("2026-11-14", [("a1", "A")])
+    items, rep = w.run(policy=EarlierPolicy(nights=1, top_up=10))
+    assert sids(items) == ["a1"] and rep.nights[0].status == "used"

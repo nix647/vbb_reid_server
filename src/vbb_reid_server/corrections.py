@@ -74,7 +74,7 @@ def _check_pages(root: Path) -> tuple[dict[str, str], set[str]]:
     if refs.exists():
         for p in json.loads(refs.read_text(encoding="utf-8")).get("people") or []:
             for ph in p.get("photos") or []:
-                if ph.get("sighting_id"):
+                if ph.get("sighting_id") and ph.get("confirmed", True):  # an unconfirmed picture is no human check
                     answered[str(ph["sighting_id"])] = "answered"
     for fz_path in sorted(root.glob("*/frozen.json")):
         if not NIGHT_RE.match(fz_path.parent.name):

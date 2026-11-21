@@ -66,9 +66,11 @@ class Trusted(dict):
     """sid -> person_id (None = someone not on the list); ``info[sid]`` = (facility, day, answered at, ms): where the
     picture's face is cached and when the answer existed (a run learns only from answers given before it started)."""
 
-    def __init__(self, *a, info: dict | None = None, **k):
+    def __init__(self, *a, info: dict | None = None, cant_tell: set | None = None, **k):
         super().__init__(*a, **k)
         self.info: dict[str, tuple[str, str, int]] = dict(info or {})
+        # pictures someone looked at and could not name: no label to learn, but a human check all the same
+        self.cant_tell: set[str] = set(cant_tell or ())
 
 
 def load_trusted(verify_root: str | Path | None) -> Trusted:
@@ -80,11 +82,14 @@ def load_trusted(verify_root: str | Path | None) -> Trusted:
     root = Path(verify_root)
     seen: dict[str, set] = {}
     info: dict[str, tuple[str, str, int]] = {}
+    cant_tell: set[str] = set()
     refs = root / "refs.json"
     if refs.exists():
         rj = json.loads(refs.read_text(encoding="utf-8"))
         for p in rj.get("people") or []:
             for ph in p.get("photos") or []:
+                if not ph.get("confirmed", True):  # the board's name, not confirmed: never a human check
+                    continue
                 seen.setdefault(str(ph["sighting_id"]), set()).add(str(p["person_id"]))
                 if rj.get("facility_id") and ph.get("day"):
                     info[str(ph["sighting_id"])] = (str(rj["facility_id"]), str(ph["day"]), int(rj.get("built_at") or 0) * 1000)
@@ -100,6 +105,8 @@ def load_trusted(verify_root: str | Path | None) -> Trusted:
         by_key = {p["key"]: str(p["person_id"]) for p in fz.get("people") or []}
         for i, it in enumerate(fz.get("items") or []):
             a = answers.get(str(i))
+            if a == "cant_tell":
+                cant_tell.add(str(it["sighting_id"]))
             if a is None or a == "cant_tell":
                 continue
             seen.setdefault(str(it["sighting_id"]), set()).add(by_key.get(a))  # "other" -> None
@@ -107,6 +114,8 @@ def load_trusted(verify_root: str | Path | None) -> Trusted:
                 info[str(it["sighting_id"])] = (str(fz["facility_id"]), str(fz["day"]), int(mk.get("updated_at") or 0) * 1000)
     from .corrections import load_answers  # lazy: corrections imports the page module, the run needs neither
     for sid, a in load_answers(root).items():
+        if isinstance(a, dict) and a.get("verdict") == "cant_tell":
+            cant_tell.add(str(sid))
         if not isinstance(a, dict) or a.get("verdict") not in ("right", "wrong"):
             continue  # can't tell, or a row this version can't read
         pid = a.get("person_id")
@@ -114,7 +123,7 @@ def load_trusted(verify_root: str | Path | None) -> Trusted:
         if a.get("facility_id") and a.get("day"):
             info[str(sid)] = (str(a["facility_id"]), str(a["day"]), int(a.get("at") or 0) * 1000)
     keep = {sid: next(iter(v)) for sid, v in seen.items() if len(v) == 1}
-    return Trusted(keep, info={sid: info[sid] for sid in keep if sid in info})
+    return Trusted(keep, info={sid: info[sid] for sid in keep if sid in info}, cant_tell=cant_tell - set(keep))
 
 
 def answered_labels(ex, trusted: dict) -> list[Sighting]:
