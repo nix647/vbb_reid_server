@@ -214,6 +214,7 @@ def test_the_batch_view_of_the_correction_list_marks_them_too(tmp_path):
     data = fix_page_data(Store(tmp_path, fetch=lambda url: b""), "pB")
     assert data["me"]["unconf"] == [0] and [p["unconf"] for p in data["people"]] == [[0]]
     html = fix_batch_html(data)
-    assert NOTE in html and "(D.me.unconf || []).includes(j)" in html and "(c.p.unconf || []).includes(j)" in html
+    assert NOTE in html and 'refRow($("refs"), D.me' in html and "(c.p.unconf || []).includes(j)" in html
+    assert "if (unconf.includes(j)) { im.className = \"unconf\"" in html  # refRow: the references row
     assert html.count('im.className = "unconf"') == 2  # the references and the choice thumbnails
     assert "--warn:#b45309" in html and "--warn:#fbbf24" in html

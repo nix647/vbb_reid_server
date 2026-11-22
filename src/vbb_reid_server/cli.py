@@ -406,8 +406,10 @@ def cmd_verify_refs(args) -> None:
     import numpy as np
 
     from .embed import load_face
-    from .verify import add_board_references, pick_references
+    from .verify import add_board_references, load_removed, pick_references
     ex, given, backend = _refs_export(args)
+    removed = load_removed(Path(args.out).parent)  # pictures a reviewer removed (beside refs.json): never again
+    exclude = set(args.exclude or []) | set(removed)
     face_id = _ids_from_cache(args.emb, "face", args.face_model)
     tables: dict = {}
 
@@ -428,7 +430,7 @@ def cmd_verify_refs(args) -> None:
         return float(t.norm[rows[0]]) if len(rows) else None
 
     refs = pick_references(ex, args.facility, [Path(f) for f in args.answers or []], one_face=one_face,
-                           exclude=set(args.exclude or []), per_person=args.per_person, answers=given)
+                           exclude=exclude, per_person=args.per_person, answers=given)
     if backend is not None:  # people nobody confirmed get pictures under the board's name, marked unconfirmed
         from datetime import date, timedelta
 
@@ -442,7 +444,7 @@ def cmd_verify_refs(args) -> None:
             except (BackendError, OSError, ValueError) as e:
                 print(f"[verify-refs] skipped {d}: could not pull it ({client.redact(str(e))})")
         add_board_references(refs, ex, str(args.facility), pulled, one_face=one_face, quality=face_norm,
-                             per_person=args.per_person)
+                             per_person=args.per_person, exclude=exclude)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(refs, indent=1, ensure_ascii=False), encoding="utf-8")
@@ -450,7 +452,8 @@ def cmd_verify_refs(args) -> None:
         board = sum(1 for x in p["photos"] if not x.get("confirmed", True))
         print(f"[verify-refs] {p['key']}: {len(p['photos'])} picture(s) over {len({x['day'] for x in p['photos']})} day(s)"
               + (", all the board's name, not confirmed" if board else ""))
-    print(f"[verify-refs] dropped: {refs['dropped']}\n[verify-refs] written to {out}")
+    print(f"[verify-refs] dropped: {refs['dropped']} ({len(removed)} picture(s) a reviewer removed are never picked)"
+          f"\n[verify-refs] written to {out}")
 
 
 def cmd_verify_build(args) -> None:

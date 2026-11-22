@@ -17,6 +17,10 @@ A staff ``known`` label is trusted when:
    staff mark says.
 2. Otherwise **it carries the reviewed mark** (``reviewed``). Without it: ``not_reviewed``, not learned from.
 
+A reference picture you removed from a person's references (``verify.load_removed``, owner 2026-11-22, plan decision
+39) is not that person: a removal outweighs any answer and any staff label naming them, so it is dropped
+(``answer_disagrees``) and never learned as them. An answer naming someone else still teaches that person.
+
 A picture answered on the check page that no user renamed is learned from too (owner 2026-11-13: every confirmed
 picture is): :func:`answered_labels` turns each answer naming a person into a label, found in that night's cache.
 
@@ -76,7 +80,9 @@ class Trusted(dict):
 def load_trusted(verify_root: str | Path | None) -> Trusted:
     """sid -> person_id you said it shows (None = someone not on the list), from ``refs.json``, every finished
     night's ``marks.json`` and the correction list's batch review (``corrections.load_answers``; can't tell names
-    nobody). A picture given two different answers is left out."""
+    nobody). A picture given two different answers is left out. A reference picture you removed from a person
+    (``verify.load_removed``) never names them: it is the one answer naming someone else, or None (not them, whoever
+    it is), dated by the removal."""
     if verify_root is None:
         return Trusted()
     root = Path(verify_root)
@@ -122,7 +128,15 @@ def load_trusted(verify_root: str | Path | None) -> Trusted:
         seen.setdefault(str(sid), set()).add(None if pid is None else str(pid))
         if a.get("facility_id") and a.get("day"):
             info[str(sid)] = (str(a["facility_id"]), str(a["day"]), int(a.get("at") or 0) * 1000)
+    from .verify import load_removed  # lazy, as above
+    removed = load_removed(root)  # sid -> person_id -> removal
+    for sid, rows in removed.items():  # a removal outweighs every answer naming the removed person
+        seen[sid] = (seen.get(sid, set()) - set(rows)) or {None}
     keep = {sid: next(iter(v)) for sid, v in seen.items() if len(v) == 1}
+    for sid, rows in removed.items():  # None: not them, whoever it is (the answers left may disagree)
+        if keep.setdefault(sid, None) is None or sid not in info:  # without a date the run would skip it
+            last = max(rows.values(), key=lambda r: r["at"])
+            info[sid] = (last["facility_id"], last["day"], last["at"] * 1000)
     return Trusted(keep, info={sid: info[sid] for sid in keep if sid in info}, cant_tell=cant_tell - set(keep))
 
 

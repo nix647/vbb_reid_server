@@ -19,6 +19,13 @@ Three steps, each its own command:
 
 The same server shows the correction list's batch review under ``/fix`` (``corrections.py``, plan decision 37).
 Unlike the nightly page it says whom the machine named, by design: a batch asks "are these all this person?".
+
+Every picture on the pages opens enlarged on a click (a batch's tiles through their corner button: a tap on a tile
+still marks it). A reference picture that does not show its person can be removed from the enlarged view, on a
+night's page or a batch (owner 2026-11-22, plan decision 39). The removal is kept by sighting id and person in
+``refs_removed.json`` (plus a line in ``refs_removed.log``), written only by the page server, and can be put back. A
+removed picture is hidden on every page, a rebuild of ``refs.json`` never picks it again, and the nightly job stops
+learning it as that person (``vetting.load_trusted``).
 """
 
 from __future__ import annotations
@@ -29,6 +36,7 @@ import json
 import os
 import random
 import re
+import threading
 import time
 import urllib.request
 from collections import defaultdict
@@ -43,6 +51,7 @@ OTHER, CANT = "other", "cant_tell"
 MAX_POST = 1 << 20
 NIGHT_RE = re.compile(r"^\d+_\d{4}-\d{2}-\d{2}$")
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")  # a sighting or person id in a /fix path
+_REMOVE_LOCK = threading.Lock()  # the page server is threaded: two removals must not save over each other
 
 
 # ------------------------------------------------------------------------ references --
@@ -120,13 +129,42 @@ def unconfirmed_photos(person: dict) -> list[int]:
     return [j for j, ph in enumerate(person.get("photos") or []) if not ph.get("confirmed", True)]
 
 
+def removed_path(verify_root: str | Path) -> Path:
+    return Path(verify_root) / "refs_removed.json"
+
+
+def load_removed(verify_root: str | Path) -> dict[str, dict[str, dict]]:
+    """sid -> person_id -> the removal of that picture from that person's reference pictures (a reviewer saw it is
+    not them): ``key``, ``facility_id``, ``day``, ``confirmed`` (it was a confirmed reference), ``at`` (seconds),
+    ``reviewer``. Written only by :meth:`Store.set_removed`; anything that isn't such a row is skipped."""
+    f = removed_path(verify_root)
+    data = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+    rows = data.get("removed") if isinstance(data, dict) else None
+    out: dict[str, dict[str, dict]] = {}
+    for sid, per in (rows.items() if isinstance(rows, dict) else ()):
+        clean = {str(pid): {"key": str(r.get("key") or ""), "facility_id": str(r.get("facility_id") or ""),
+                            "day": str(r.get("day") or ""), "confirmed": r.get("confirmed") is not False,
+                            "at": r["at"] if type(r.get("at")) is int else 0, "reviewer": str(r.get("reviewer") or "")}
+                 for pid, r in (per.items() if isinstance(per, dict) else ()) if isinstance(r, dict)}
+        if clean:
+            out[str(sid)] = clean
+    return out
+
+
+def removed_photos(person: dict, removed: dict) -> list[int]:
+    """Indexes of a person's reference photos a reviewer removed from that person (``removed``: :func:`load_removed`)."""
+    pid = str(person.get("person_id"))
+    return [j for j, ph in enumerate(person.get("photos") or []) if pid in removed.get(str(ph.get("sighting_id")), {})]
+
+
 def add_board_references(refs: dict, ex, facility: str, pulled: dict[str, list[dict]], *, one_face, quality,
-                         per_person: int = 6) -> dict:
+                         per_person: int = 6, exclude: set[str] = frozenset()) -> dict:
     """A roster person with no confirmed reference picture gets up to ``per_person`` pictures under the BOARD's name
     (W8): sightings the board named that person, with no human overlay of any kind, an uploaded picture and exactly
     one face, best face quality first, one per day in turn. Each carries ``confirmed: false``. ``pulled``: day ->
     that day's sighting rows from the backend (a day whose pull failed is simply absent). ``quality(sid, day)`` is
-    the cached face's raw norm (None ranks last). The sorter's names are never used."""
+    the cached face's raw norm (None ranks last). The sorter's names are never used. ``exclude``: sighting ids never
+    to pick (a picture a reviewer removed)."""
     roster = ex.roster(facility)
     pool: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
     dropped: dict[str, int] = defaultdict(int)
@@ -138,6 +176,8 @@ def add_board_references(refs: dict, ex, facility: str, pulled: dict[str, list[d
             key = ex.key(str(r["board_person_id"]))
             if key not in roster:
                 dropped["not a roster person"] += 1
+            elif sid in exclude:
+                dropped["excluded"] += 1
             elif r.get("human_labeled") or r.get("human_state"):
                 dropped["has a human overlay"] += 1
             elif not str(r.get("image_url") or "").startswith(IMAGE_PREFIX):
@@ -337,6 +377,62 @@ class Store:
             return None
         return self.fetch(url)
 
+    def removed(self) -> dict[str, dict[str, dict]]:
+        return load_removed(self.root)
+
+    def set_removed(self, people: list, facility: str, body) -> list[int]:
+        """Remove reference picture ``j`` of ``people[ref]`` from that person's references, or put it back
+        (``body``: ``ref``, ``j``, ``removed``, ``reviewer``). Refused (``ValueError``) unless it names a picture on
+        the page. A second removal keeps the first one's time. -> that person's removed picture indexes."""
+        if not isinstance(body, dict):
+            raise ValueError("the change must be an object")
+        ref, j, out = body.get("ref"), body.get("j"), body.get("removed")
+        if type(ref) is not int or type(j) is not int or type(out) is not bool or ref < 0 or j < 0:
+            raise ValueError("ref and j must be picture numbers, removed true or false")
+        try:
+            p = people[ref]
+            ph = p["photos"][j]
+            sid, pid = str(ph["sighting_id"]), str(p["person_id"])
+        except (IndexError, KeyError, TypeError):
+            raise ValueError("no such reference picture") from None
+        if not facility:
+            raise ValueError("these reference pictures name no facility: rebuild refs.json")
+        reviewer = str(body.get("reviewer") or "")[:40]
+        stamp = int(time.time())
+        with _REMOVE_LOCK:
+            f = removed_path(self.root)
+            data = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+            data = data if isinstance(data, dict) else {}
+            rows = data["removed"] = data["removed"] if isinstance(data.get("removed"), dict) else {}
+            mine = rows[sid] if isinstance(rows.get(sid), dict) else {}
+            if out and pid not in mine:
+                mine[pid] = {"key": str(p.get("key") or ""), "facility_id": facility, "day": str(ph.get("day") or ""),
+                             "confirmed": ph.get("confirmed", True) is not False, "at": stamp, "reviewer": reviewer}
+            elif not out:
+                mine.pop(pid, None)
+            if mine:
+                rows[sid] = mine
+            else:
+                rows.pop(sid, None)
+            _atomic_json(f, data)
+            with f.with_name("refs_removed.log").open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"at": stamp, "sighting_id": sid, "person_id": pid, "removed": out,
+                                     "reviewer": reviewer}) + "\n")
+        return removed_photos(p, load_removed(self.root))
+
+    def refs_built_at(self):
+        f = self.root / "refs.json"
+        return json.loads(f.read_text(encoding="utf-8")).get("built_at") if f.exists() else None
+
+    def fix_set_removed(self, body) -> list[int]:
+        """A removal on a batch page, whose reference pictures are ``refs.json``'s: refused when a rebuild changed
+        them since the page loaded (``built_at``), so a number never points at another picture."""
+        f = self.root / "refs.json"
+        rj = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+        if not isinstance(body, dict) or body.get("built_at") != rj.get("built_at"):
+            raise ValueError("the reference pictures changed since this page loaded: reload it")
+        return self.set_removed(rj.get("people") or [], str(rj.get("facility_id") or ""), body)
+
     # the correction list's batch review (corrections.py reads and writes; imported late: it imports this module)
     def fix_people(self) -> list[dict]:
         from .corrections import review_people
@@ -364,13 +460,15 @@ class Store:
         return self.fetch(url) if isinstance(url, str) and url.startswith(IMAGE_PREFIX) else None
 
 
-def page_data(fz: dict) -> dict:
+def page_data(fz: dict, removed: dict | None = None) -> dict:
     """What the reviewer's page receives: labels, names and picture counts. No machine output, no links.
     Only people with reference pictures are offered: one nobody can recognise is no use as a choice, and a
     person without a single labeled picture has no references, so the machine cannot name them either.
-    ``ref`` keeps the person's place in ``frozen.json`` for ``/ref/<night>/<ref>/<j>``."""
+    ``ref`` keeps the person's place in ``frozen.json`` for ``/ref/<night>/<ref>/<j>``. ``removed``
+    (:func:`load_removed`) hides pictures, never a person: the choices and their keys stay as the night was drawn."""
     people = [{"key": p["key"], "name": p.get("name", ""), "photos": len(p["photos"]), "ref": i,
-               "unconf": unconfirmed_photos(p)} for i, p in enumerate(fz["people"]) if p["photos"]]
+               "unconf": unconfirmed_photos(p), "removed": removed_photos(p, removed or {})}
+              for i, p in enumerate(fz["people"]) if p["photos"]]
     return {"day": fz["day"], "n": len(fz["items"]), "people": people}
 
 
@@ -383,14 +481,15 @@ def fix_page_data(store: Store, machine: str) -> dict:
     """What a batch page receives: whom the machine named (its label and reference pictures), the other people
     one can answer with, and up to ``BATCH`` of its open pictures by id. No links, scores or board names."""
     from .corrections import BATCH
-    people = store.fix_people()
+    people, removed = store.fix_people(), store.removed()
     offered = [{"key": p["key"], "name": p.get("name", ""), "photos": len(p["photos"]), "ref": i,
-                "unconf": unconfirmed_photos(p)} for i, p in enumerate(people) if p.get("photos")]
+                "unconf": unconfirmed_photos(p), "removed": removed_photos(p, removed)}
+               for i, p in enumerate(people) if p.get("photos")]
     me = next((o for o in offered if str(people[o["ref"]]["person_id"]) == machine), None)
     todo = store.fix_todo().get(machine, [])
     return {"machine": machine, "label": _label(people, machine), "me": me,
             "people": [o for o in offered if o is not me], "items": [i["sighting_id"] for i in todo[:BATCH]],
-            "left": len(todo), "batch": BATCH}
+            "left": len(todo), "batch": BATCH, "built_at": store.refs_built_at()}
 
 
 def make_handler(store: Store):
@@ -411,6 +510,16 @@ def make_handler(store: Store):
         def _json(self, code: int, obj):
             self._send(code, json.dumps(obj, ensure_ascii=False).encode(), "application/json")
 
+        def _change(self, apply):
+            size = int(self.headers.get("Content-Length") or 0)
+            if size > MAX_POST:
+                return self._send(413, b"too large", "text/plain")
+            try:
+                out = apply(json.loads(self.rfile.read(size) or b"{}"))
+            except (ValueError, json.JSONDecodeError) as e:
+                return self._json(400, {"error": str(e)})
+            return self._json(200, out)
+
         def _loopback(self) -> bool:
             host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
             return host in ("127.0.0.1", "localhost", "[::1]")
@@ -428,7 +537,8 @@ def make_handler(store: Store):
                 if len(parts) == 3 and parts[2] == "marks":
                     return self._json(200, store.marks(parts[1]))
                 if len(parts) == 2:
-                    return self._send(200, night_html(parts[1], page_data(fz)).encode(), "text/html; charset=utf-8")
+                    return self._send(200, night_html(parts[1], page_data(fz, store.removed())).encode(),
+                                      "text/html; charset=utf-8")
             if parts[0] == "fix" and len(parts) == 1:
                 return self._send(200, fix_index_html(store).encode(), "text/html; charset=utf-8")
             if parts[0] == "fix" and len(parts) == 3 and parts[1] == "p" and _ID_RE.match(parts[2]):
@@ -468,6 +578,14 @@ def make_handler(store: Store):
                 except (ValueError, json.JSONDecodeError) as e:
                     return self._json(400, {"error": str(e)})
                 return self._json(200, out)
+            if parts == ["fix", "refs"]:  # a reference picture removed on a batch page, or put back
+                return self._change(lambda body: {"removed": store.fix_set_removed(body)})
+            if len(parts) == 3 and parts[0] == "n" and parts[2] == "refs":  # the same on a night's page
+                fz = store.frozen(parts[1])
+                if fz is None:
+                    return self._send(404, b"no such night", "text/plain")
+                return self._change(lambda body: {"removed": store.set_removed(
+                    fz["people"], str(fz.get("facility_id") or ""), body)})
             if len(parts) != 3 or parts[0] != "n" or parts[2] != "marks":
                 return self._send(404, b"not found", "text/plain")
             fz = store.frozen(parts[1])
@@ -504,6 +622,60 @@ table{border-collapse:collapse;margin:8px 0 16px}td,th{border-bottom:1px solid v
 a{color:var(--accent)}
 img.unconf{outline:3px solid var(--warn);outline-offset:1px}.unconf-note{color:var(--warn);font-size:12px;white-space:nowrap}
 </style>"""
+
+# The enlarged view, shared by every page; it must come before a page's own script, which calls it. A page's script
+# must not declare NOTE, Z, zoom, unzoom, refRow or zoomRef again (one global scope: a second const is an error).
+_ZOOM = """<style>
+.zoom{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.9);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:8px;cursor:zoom-out}
+.zoom[hidden]{display:none}
+.zoom img{width:96vw;height:calc(100vh - 96px);object-fit:contain}
+.zbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:center;color:#eee;font-size:14px;cursor:default}
+.zbar button{padding:6px 12px;font-size:14px;border-radius:6px;border:1px solid #888;background:#222;color:#eee;cursor:pointer}
+.zerr{color:#f87171}
+img.zoomable,.ref img,.refs img,#pic,.panel button img{cursor:zoom-in}
+img.removed{opacity:.35;outline:3px dashed var(--bad);outline-offset:1px}
+.linkish{background:none;border:0;color:var(--accent);cursor:pointer;font-size:12px;padding:0 4px;white-space:nowrap}
+</style>
+<div class="zoom" id="zoom" hidden><img id="zimg" alt="enlarged picture"><div class="zbar"><span id="zcap"></span>
+<span id="zact"></span><button id="zclose">Close (Esc)</button></div></div>
+<script>
+const NOTE = "board's name, not confirmed";  // a reference picture the board named: nobody checked it
+const Z = {open: false};
+function zoom(src, cap, extra){ document.getElementById("zimg").src = src; document.getElementById("zcap").textContent = cap || "";
+  document.getElementById("zact").replaceChildren(...(extra ? [extra] : [])); document.getElementById("zoom").hidden = false; Z.open = true; }
+function unzoom(){ document.getElementById("zoom").hidden = true; Z.open = false; }
+document.getElementById("zclose").onclick = unzoom;
+document.getElementById("zoom").addEventListener("click", ev => { if (!ev.target.closest(".zbar")) unzoom(); });  // not a button
+document.addEventListener("keydown", ev => { if (Z.open && ev.key === "Escape") unzoom(); });
+document.addEventListener("click", ev => { const im = ev.target.closest ? ev.target.closest("img.zoomable") : null;
+  if (im) zoom(im.src, im.alt); });
+// One person's reference pictures into ``row``: removed ones only while shown; a click opens one enlarged (onPick).
+function refRow(row, p, src, shown, toggle, onPick){ const gone = p.removed || [], unconf = p.unconf || [];
+  for (let j = 0; j < p.photos; j++) { const out = gone.includes(j); if (out && !shown) continue;
+    const im = document.createElement("img"); im.loading = "lazy"; im.alt = "reference picture"; im.src = src(j);
+    if (unconf.includes(j)) { im.className = "unconf"; im.title = NOTE; }
+    if (out) { im.classList.add("removed"); im.title = "removed: not this person"; }
+    im.onclick = ev => { ev.stopPropagation(); onPick(j); }; row.appendChild(im); }
+  const note = (cls, text) => { const n = document.createElement("span"); n.className = cls; n.textContent = text; row.appendChild(n); };
+  if (unconf.some(j => !gone.includes(j))) note("unconf-note", NOTE);
+  if (gone.length >= p.photos) note("muted", "no reference pictures left");
+  if (gone.length) { const t = document.createElement("button"); t.className = "linkish";
+    t.textContent = shown ? "hide removed" : gone.length + " removed · show"; t.onclick = ev => { ev.stopPropagation(); toggle(!shown); };
+    row.appendChild(t); } }
+// Reference picture j of p, enlarged, with the way to remove it from p's references or put it back. post(change)
+// -> a fetch promise answering {removed: [...]}; redraw() repaints the page's rows.
+function zoomRef(p, j, src, label, post, redraw){ const out = (p.removed || []).includes(j);
+  const box = document.createElement("span"), b = document.createElement("button"), msg = document.createElement("span");
+  msg.className = "zerr";
+  b.textContent = out ? "Put it back as " + p.key + "'s reference" : "Not " + p.key + ": remove it from the references";
+  b.onclick = async () => { b.disabled = true;
+    try { const r = await post({ref: p.ref, j: j, removed: !out}); if (!r.ok) throw new Error(await r.text());
+      p.removed = (await r.json()).removed; redraw(); zoomRef(p, j, src, label, post, redraw); }
+    catch (e) { b.disabled = false; msg.textContent = "Not saved: " + e.message; } };
+  box.append(b, " ", msg);
+  zoom(src(j), label + " · reference " + (j + 1) + " of " + p.photos + ((p.unconf || []).includes(j) ? " · " + NOTE : "")
+    + (out ? " · removed: not this person" : ""), box); }
+</script>"""
 
 
 def _pct(x):
@@ -545,18 +717,22 @@ def index_html(store: Store) -> str:
 
     head = "<tr><th>{}</th><th>right</th><th>wrong</th><th>share right</th><th>at least (97.5 %)</th></tr>"
     wrong_html = "".join(
-        f"<tr><td>{e(day)}</td><td><img src='/img/{e(night)}/{x['i']}' style='height:120px'></td>"
+        f"<tr><td>{e(day)}</td><td><img class=zoomable alt='{e(day)}' src='/img/{e(night)}/{x['i']}' style='height:120px'></td>"
         f"<td>machine: {e(names.get(x['machine'], x['machine'][-6:]))}<br>answer: {e(x['answer'])}</td>"
         f"<td class=muted>{e(x['via'])} face {e(str(x['face_sim']))} body {e(str(x['body_sim']))}</td></tr>"
         for night, day, x in wrong_rows) or "<tr><td class=muted>none</td></tr>"
     left = sum(len(v) for v in store.fix_todo().values())
+    gone = sum(len(v) for v in store.removed().values())
+    gone_html = (f"<p class=muted>{gone} reference picture(s) removed as not showing their person. Open a night to "
+                 f"see them or put them back.</p>") if gone else ""
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Nightly name check</title>{_STYLE}</head>
-<body><main><h2>Nightly name check</h2>
+<body><main>{_ZOOM}<h2>Nightly name check</h2>
 <p class=muted>Each night, a random sample of the new names the machine gave (labels are still hidden in the app):
 it measures how often the machine is right.
-Open a night, say who each picture shows, then press "I'm done". Results appear only after that.</p>
-<p><a href='/fix'>Correction list</a>: {left} picture(s) to review.</p>
+Open a night, say who each picture shows, then press "I'm done". Results appear only after that.
+Click any picture to see it larger.</p>
+<p><a href='/fix'>Correction list</a>: {left} picture(s) to review.</p>{gone_html}
 <table><tr><th>night</th><th>new names</th><th>sample</th><th>status</th><th>result</th><th>reviewer</th></tr>{''.join(rows)}</table>
 <h3>All finished nights, by how the name was made</h3><table>{head.format('via')}{tally(tot_via, lambda k: k)}</table>
 <h3>By the person the machine named</h3><table>{head.format('person')}{tally(tot_person, lambda k: names.get(k, k[-6:]))}</table>
@@ -583,29 +759,35 @@ _NIGHT = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 .choices button.on{outline:3px solid var(--accent)}
 .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px}
 #status.bad{color:var(--bad)}
-</style></head><body><main>
+</style></head><body><main>""" + _ZOOM + """
 <div class="bar"><a href="/">← all nights</a><b id="title"></b><span id="progress"></span>
 <label class="muted">Your name <input id="reviewer" maxlength="40" style="width:9em"></label><span id="status" class="muted"></span></div>
 <p class="muted">Compare each picture with the reference pictures below and pick who it is. If it shows two people, answer
-for the main one. Keys: 1–9 pick a person, o = someone else, x = can't tell, ← → move.</p>
+for the main one. Keys: 1–9 pick a person, o = someone else, x = can't tell, ← → move. Click any picture to see it
+larger. A reference picture that doesn't show its person can be removed from there.</p>
 <div class="refs" id="refs"></div>
 <div class="stage"><div><img id="pic" alt="picture"></div><div class="choices" id="choices" style="min-width:16em"></div></div>
 <div class="bar"><button id="prev">← Back</button><button id="next">Next →</button><button id="done">I'm done</button></div>
 <script>
 const D = __DATA__, NIGHT = __NIGHT__;
-const NOTE = "board's name, not confirmed";  // a reference picture the board named: nobody checked it
 let marks = {answers:{}, seen:[], failed:[], submitted:false, reviewer:""}, loaded = false, cur = 0, timer = null, pending = false;
 const seen = new Set(), failed = new Set();
 const $ = id => document.getElementById(id);
 $("title").textContent = "Night " + D.day;
 const choices = D.people.map((p, i) => ({v: p.key, label: (i + 1) + ". " + p.key + (p.name ? " · " + p.name : "")}))
   .concat([{v: "other", label: "o. Stranger or someone else"}, {v: "cant_tell", label: "x. Can't tell"}]);
-D.people.forEach((p, i) => { const row = document.createElement("div"); row.className = "ref";
-  const b = document.createElement("b"); b.textContent = (i + 1) + ". " + p.key + (p.name ? " · " + p.name : ""); row.appendChild(b);
-  for (let j = 0; j < p.photos; j++) { const im = document.createElement("img"); im.loading = "lazy"; im.src = "/ref/" + NIGHT + "/" + p.ref + "/" + j;
-    if ((p.unconf || []).includes(j)) { im.className = "unconf"; im.title = NOTE; } row.appendChild(im); }
-  if ((p.unconf || []).length) { const n = document.createElement("span"); n.className = "unconf-note"; n.textContent = NOTE; row.appendChild(n); }
-  $("refs").appendChild(row); });
+const shownRemoved = new Set();  // people whose removed reference pictures are shown
+const refSrc = p => j => "/ref/" + NIGHT + "/" + p.ref + "/" + j;
+const postRef = change => fetch("/n/" + NIGHT + "/refs", {method: "POST", headers: {"Content-Type": "application/json", "X-Review": "1"},
+  body: JSON.stringify(Object.assign({reviewer: $("reviewer").value}, change))});
+function drawRefs(){ $("refs").replaceChildren();
+  D.people.forEach((p, i) => { const row = document.createElement("div"); row.className = "ref";
+    const b = document.createElement("b"); b.textContent = (i + 1) + ". " + p.key + (p.name ? " · " + p.name : ""); row.appendChild(b);
+    refRow(row, p, refSrc(p), shownRemoved.has(i), on => { if (on) shownRemoved.add(i); else shownRemoved.delete(i); drawRefs(); },
+      j => zoomRef(p, j, refSrc(p), b.textContent, postRef, drawRefs));
+    $("refs").appendChild(row); }); }
+drawRefs();
+$("pic").onclick = () => { if (seen.has(cur)) zoom($("pic").src, "Picture " + (cur + 1) + " of " + D.n); };
 choices.forEach(c => { const b = document.createElement("button"); b.textContent = c.label; b.dataset.v = c.v;
   b.onclick = () => { b.blur(); answer(c.v); }; $("choices").appendChild(b); });  // blur: Enter must not repeat it
 function status(t, bad){ $("status").textContent = t; $("status").className = bad ? "bad" : "muted"; }
@@ -632,7 +814,7 @@ $("done").onclick = () => { const left = D.n - Object.keys(marks.answers).length
   marks.submitted = true; clearTimeout(timer); save().then(ok => { if (ok) location.href = "/"; }); };
 $("reviewer").onchange = () => { try { localStorage.setItem("reviewer", $("reviewer").value); } catch (e) {} queue(); };
 try { $("reviewer").value = localStorage.getItem("reviewer") || ""; } catch (e) {}
-document.addEventListener("keydown", ev => { if (ev.target.tagName === "INPUT") return; const k = ev.key.toLowerCase();
+document.addEventListener("keydown", ev => { if (Z.open || ev.target.tagName === "INPUT") return; const k = ev.key.toLowerCase();
   if (k === "arrowleft") return $("prev").onclick(); if (k === "arrowright") return $("next").onclick();
   if (/^[1-9]$/.test(k) && D.people[+k - 1]) return answer(D.people[+k - 1].key);
   if (k === "o") return answer("other"); if (k === "x") return answer("cant_tell"); });
@@ -682,7 +864,8 @@ _FIX = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 .refs{display:flex;gap:6px;align-items:center;overflow-x:auto;border-bottom:1px solid var(--line);padding-bottom:8px}
 .refs img{height:96px;border-radius:4px}
 .grid{display:flex;flex-wrap:wrap;gap:10px;margin:12px 0 96px}
-.tile{width:150px;margin:0;cursor:pointer;border:3px solid transparent;border-radius:8px;padding:2px}
+.tile{position:relative;width:150px;margin:0;cursor:pointer;border:3px solid transparent;border-radius:8px;padding:2px}
+.zbtn{position:absolute;top:6px;right:6px;padding:2px 6px;font-size:14px;border:0;border-radius:4px;background:rgba(0,0,0,.55);color:#fff;cursor:zoom-in}
 .tile img{width:100%;height:200px;object-fit:contain;background:#888;border-radius:5px;display:block}
 .tile figcaption{font-size:12px;color:var(--muted);min-height:2.6em}
 .tile.marked{border-color:var(--bad)}.tile.marked figcaption{color:var(--bad)}
@@ -692,31 +875,36 @@ _FIX = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 .foot{position:fixed;left:0;right:0;bottom:0;background:var(--card);border-top:1px solid var(--line);padding:10px 16px}
 .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 #status.bad{color:var(--bad)}
-</style></head><body><main>
+</style></head><body><main>""" + _ZOOM + """
 <div class="bar"><a href="/fix">← correction list</a><b id="title"></b><span id="left" class="muted"></span>
 <label class="muted">Your name <input id="reviewer" maxlength="40" style="width:9em"></label><span id="status" class="muted"></span></div>
 <p class="muted">The machine says every picture below shows <b id="who"></b>. Compare them with the reference
 pictures. Tap a picture that doesn't, and say who it is. Pictures you saw and left alone confirm the name. A
-picture counts as seen once it has loaded and stayed at least half on screen for a moment; the rest stay on the list.</p>
+picture counts as seen once it has loaded and stayed at least half on screen for a moment; the rest stay on the list.
+🔍 on a picture shows it larger. Click a reference picture to see it larger, and remove it there if it doesn't show
+its person.</p>
 <div class="refs" id="refs"></div>
 <div class="grid" id="grid"></div>
 <div class="panel" id="panel" hidden><div class="bar"><b id="ptitle"></b><button id="pclose" style="width:auto">close</button></div><div id="pchoices"></div></div>
 <div class="foot" id="foot"><div class="bar"><button id="submit"></button></div></div>
 <script>
 const D = __DATA__;
-const NOTE = "board's name, not confirmed";  // a reference picture the board named: nobody checked it
 const $ = id => document.getElementById(id);
 const marks = {}, seen = new Set(), loaded = new Set(), vis = new Set(), timers = {};
-let open = null, saving = false;
+let open = null, saving = false, meShown = false;
 const label = p => p.key + (p.name ? " · " + p.name : "");
 $("title").textContent = D.label;
 $("who").textContent = D.label;
 $("left").textContent = D.left + " to review for this person";
 function status(t, bad){ $("status").textContent = t; $("status").className = bad ? "bad" : "muted"; }
-if (D.me) { for (let j = 0; j < D.me.photos; j++) { const im = document.createElement("img"); im.src = "/fixref/" + D.me.ref + "/" + j;
-    if ((D.me.unconf || []).includes(j)) { im.className = "unconf"; im.title = NOTE; } $("refs").appendChild(im); }
-  if ((D.me.unconf || []).length) { const n = document.createElement("span"); n.className = "unconf-note"; n.textContent = NOTE; $("refs").appendChild(n); } }
-else { const m = document.createElement("span"); m.className = "muted"; m.textContent = "No reference pictures for this person."; $("refs").appendChild(m); }
+const fixSrc = p => j => "/fixref/" + p.ref + "/" + j;
+const postRef = change => fetch("/fix/refs", {method: "POST", headers: {"Content-Type": "application/json", "X-Review": "1"},
+  body: JSON.stringify(Object.assign({reviewer: $("reviewer").value, built_at: D.built_at}, change))});
+const zoomPerson = (p, j) => zoomRef(p, j, fixSrc(p), label(p), postRef, () => { drawMe(); if (open) pick(open); });
+function drawMe(){ $("refs").replaceChildren();
+  if (D.me) refRow($("refs"), D.me, fixSrc(D.me), meShown, on => { meShown = on; drawMe(); }, j => zoomPerson(D.me, j));
+  else { const m = document.createElement("span"); m.className = "muted"; m.textContent = "No reference pictures for this person."; $("refs").appendChild(m); } }
+drawMe();
 const choices = D.people.map(p => ({v: p.key, text: "It's " + label(p), p}))
   .concat([{v: "other", text: "Someone else, or a stranger"}, {v: "cant_tell", text: "Can't tell"}]);
 const answerText = v => { const c = choices.find(c => c.v === v); return c ? c.text : v; };
@@ -739,14 +927,19 @@ D.items.forEach(sid => { const f = document.createElement("figure"); f.className
   im.onload = () => { loaded.add(sid); arm(sid, f); };
   im.onerror = () => { f.querySelector("figcaption").textContent = "did not load"; };
   im.src = "/fiximg/" + encodeURIComponent(sid);
-  f.appendChild(im); f.appendChild(document.createElement("figcaption"));
+  const zb = document.createElement("button"); zb.className = "zbtn"; zb.type = "button"; zb.textContent = "🔍"; zb.title = "see it larger";
+  zb.onclick = ev => { ev.stopPropagation(); const m = document.createElement("button"); m.textContent = "Not " + D.label + "? Say who it is";
+    m.onclick = () => { unzoom(); pick(sid); }; zoom(im.src, "The machine says: " + D.label, m); };
+  f.appendChild(im); f.appendChild(zb); f.appendChild(document.createElement("figcaption"));
   f.onclick = () => pick(sid); tiles[sid] = f; $("grid").appendChild(f); io.observe(f); });
 function pick(sid){ if (!seen.has(sid)) { status("Let the picture show for a moment first", true); return; }
   open = sid; $("ptitle").textContent = "Not " + D.label + "? Who is it?"; $("pchoices").innerHTML = "";
   const all = choices.concat(sid in marks ? [{v: null, text: "It is " + D.label + " after all (clear the mark)"}] : []);
   all.forEach(c => { const b = document.createElement("button"); const t = document.createElement("span"); t.textContent = c.text; b.appendChild(t);
-    if (c.p) for (let j = 0; j < Math.min(3, c.p.photos); j++) { const im = document.createElement("img"); im.src = "/fixref/" + c.p.ref + "/" + j;
-      if ((c.p.unconf || []).includes(j)) { im.className = "unconf"; im.title = NOTE; } b.appendChild(im); }
+    if (c.p) [...Array(c.p.photos).keys()].filter(j => !(c.p.removed || []).includes(j)).slice(0, 3).forEach(j => {
+      const im = document.createElement("img"); im.src = fixSrc(c.p)(j); im.alt = "reference picture";
+      if ((c.p.unconf || []).includes(j)) { im.className = "unconf"; im.title = NOTE; }
+      im.onclick = ev => { ev.stopPropagation(); zoomPerson(c.p, j); }; b.appendChild(im); });
     b.onclick = () => { if (c.v === null) delete marks[open]; else marks[open] = c.v; caption(tiles[open]); closePanel(); update(); };
     $("pchoices").appendChild(b); });
   $("panel").hidden = false; $("foot").hidden = true; }
