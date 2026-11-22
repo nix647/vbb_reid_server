@@ -133,13 +133,22 @@ def removed_path(verify_root: str | Path) -> Path:
     return Path(verify_root) / "refs_removed.json"
 
 
+def _removed_file(f: Path) -> dict:
+    """The removal file as written ({} when absent or not an object). One that isn't JSON raises ``ValueError`` naming
+    it: the nightly job must fail rather than learn removed pictures, and the page must not save over it."""
+    try:
+        data = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{f} (reference pictures a reviewer removed) is not readable: {e}") from None
+    return data if isinstance(data, dict) else {}
+
+
 def load_removed(verify_root: str | Path) -> dict[str, dict[str, dict]]:
     """sid -> person_id -> the removal of that picture from that person's reference pictures (a reviewer saw it is
     not them): ``key``, ``facility_id``, ``day``, ``confirmed`` (it was a confirmed reference), ``at`` (seconds),
-    ``reviewer``. Written only by :meth:`Store.set_removed`; anything that isn't such a row is skipped."""
-    f = removed_path(verify_root)
-    data = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
-    rows = data.get("removed") if isinstance(data, dict) else None
+    ``reviewer``. Written only by :meth:`Store.set_removed`; anything that isn't such a row is skipped, and a file that
+    isn't JSON raises (:func:`_removed_file`)."""
+    rows = _removed_file(removed_path(verify_root)).get("removed")
     out: dict[str, dict[str, dict]] = {}
     for sid, per in (rows.items() if isinstance(rows, dict) else ()):
         clean = {str(pid): {"key": str(r.get("key") or ""), "facility_id": str(r.get("facility_id") or ""),
@@ -401,8 +410,7 @@ class Store:
         stamp = int(time.time())
         with _REMOVE_LOCK:
             f = removed_path(self.root)
-            data = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
-            data = data if isinstance(data, dict) else {}
+            data = _removed_file(f)
             rows = data["removed"] = data["removed"] if isinstance(data.get("removed"), dict) else {}
             mine = rows[sid] if isinstance(rows.get(sid), dict) else {}
             if out and pid not in mine:
@@ -641,8 +649,15 @@ img.removed{opacity:.35;outline:3px dashed var(--bad);outline-offset:1px}
 <script>
 const NOTE = "board's name, not confirmed";  // a reference picture the board named: nobody checked it
 const Z = {open: false};
-function zoom(src, cap, extra){ document.getElementById("zimg").src = src; document.getElementById("zcap").textContent = cap || "";
-  document.getElementById("zact").replaceChildren(...(extra ? [extra] : [])); document.getElementById("zoom").hidden = false; Z.open = true; }
+// The previous picture is cleared first, and the buttons wait for this one: a browser keeps showing the old picture
+// until the new one loads, and nobody may act on a picture they never saw.
+function zoom(src, cap, extra){ const im = document.getElementById("zimg"), c = document.getElementById("zcap");
+  const buttons = extra ? (extra.tagName === "BUTTON" ? [extra] : [...extra.querySelectorAll("button")]) : [];
+  buttons.forEach(b => b.disabled = true); im.removeAttribute("src"); im.style.visibility = "hidden"; c.textContent = cap || "";
+  im.onload = () => { im.style.visibility = ""; buttons.forEach(b => b.disabled = false); };
+  im.onerror = () => { c.textContent = (cap || "") + " · the picture did not load"; };
+  im.src = src; document.getElementById("zact").replaceChildren(...(extra ? [extra] : []));
+  document.getElementById("zoom").hidden = false; Z.open = true; document.getElementById("zclose").focus(); }  // focus: Enter must not press a button behind
 function unzoom(){ document.getElementById("zoom").hidden = true; Z.open = false; }
 document.getElementById("zclose").onclick = unzoom;
 document.getElementById("zoom").addEventListener("click", ev => { if (!ev.target.closest(".zbar")) unzoom(); });  // not a button

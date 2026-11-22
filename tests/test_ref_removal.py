@@ -143,6 +143,18 @@ def test_a_removed_reference_is_never_learned_as_that_person(tmp_path):
     assert load_trusted(root) == {"r1": "pA", "r2": "pA"}  # x1, x2: two answers again; b1: never an answer
 
 
+def test_an_unreadable_removal_file_stops_the_run_and_names_the_file(srv):
+    """Written atomically, so only a damaged disk truncates it. The nightly job must then fail, not learn the removed
+    pictures as their people again; the page refuses removals with the same message."""
+    base, root = srv
+    removed_path(root).write_text('{"removed": {"r2": ')
+    with pytest.raises(ValueError, match="refs_removed.json"):
+        load_trusted(root)
+    code, out = _post(base, f"/n/{NIGHT}/refs", {"ref": 0, "j": 0, "removed": True})
+    assert code == 400 and "refs_removed.json" in out["error"]
+    assert removed_path(root).read_text() == '{"removed": {"r2": '  # left for a person to look at
+
+
 def test_a_rebuild_never_picks_a_removed_picture_again(tmp_path, monkeypatch):
     fake = world(tmp_path)  # pA: nine confirmed pictures r0..r8; pB: none, so the board's best faces
     removed_path(tmp_path).write_text(json.dumps({"removed": {  # beside the refs.json run_cli writes

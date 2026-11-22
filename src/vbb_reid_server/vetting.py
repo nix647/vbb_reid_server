@@ -19,7 +19,9 @@ A staff ``known`` label is trusted when:
 
 A reference picture you removed from a person's references (``verify.load_removed``, owner 2026-11-22, plan decision
 39) is not that person: a removal outweighs any answer and any staff label naming them, so it is dropped
-(``answer_disagrees``) and never learned as them. An answer naming someone else still teaches that person.
+(``answer_disagrees``) and never learned as them. A check-page answer naming someone else still teaches that person;
+a staff label naming someone else does not (known limit: the removal reads as "not on the list", so a later staff
+correction of that one picture is lost to learning, never turned into a wrong name).
 
 A picture answered on the check page that no user renamed is learned from too (owner 2026-11-13: every confirmed
 picture is): :func:`answered_labels` turns each answer naming a person into a label, found in that night's cache.
