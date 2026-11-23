@@ -12,7 +12,8 @@ Three steps, each its own command:
   promotions, uniform, seeded by the run id) into ``<root>/<facility>_<day>/frozen.json``, read-only.
   It never draws twice: if the night exists, it does nothing.
 - ``verify-serve``: a loopback-only page reached by an ssh tunnel, for as long as the ssh session
-  lasts. The reviewer's page never receives the machine's name, the via, any score, the board's
+  lasts; or, with ``--bind <the box's office address>`` (owner 2026-11-23), a page anyone on the office network opens
+  at that address, with no login. The reviewer's page never receives the machine's name, the via, any score, the board's
   state or picture links: pictures come through ``/img`` from links in ``frozen.json`` only. Answers
   save to ``marks.json`` (atomic) plus a line in ``marks.log``. Results are shown only for nights
   marked done, so judging the next picture never follows feedback on the last.
@@ -500,7 +501,16 @@ def fix_page_data(store: Store, machine: str) -> dict:
             "left": len(todo), "batch": BATCH, "built_at": store.refs_built_at()}
 
 
-def make_handler(store: Store):
+LOOPBACK = "127.0.0.1"
+
+
+def make_handler(store: Store, bind: str = LOOPBACK):
+    """``bind``: the address the server listens on. Requests must name it, or a loopback name, as their Host: a page
+    of another site that points its own name at this address (DNS rebinding) is refused."""
+    if bind in ("", "0.0.0.0", "::"):  # every address: the box's VPN and VM links would see it too
+        raise ValueError(f"listen on one address of this box, not {bind!r}")
+    hosts = {"127.0.0.1", "localhost", "[::1]", f"[{bind}]" if ":" in bind else bind}
+
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):  # keep the ssh session quiet
             pass
@@ -530,7 +540,7 @@ def make_handler(store: Store):
 
         def _loopback(self) -> bool:
             host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
-            return host in ("127.0.0.1", "localhost", "[::1]")
+            return host in hosts
 
         def do_GET(self):
             if not self._loopback():
@@ -610,9 +620,10 @@ def make_handler(store: Store):
     return H
 
 
-def serve(root: Path, port: int, log=print) -> None:
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(Store(root)))
-    log(f"[verify] serving {root} on http://127.0.0.1:{port}/ (Ctrl-C or closing ssh stops it)")
+def serve(root: Path, port: int, log=print, bind: str = LOOPBACK) -> None:
+    handler = make_handler(Store(root), bind)
+    httpd = ThreadingHTTPServer((bind, port), handler)
+    log(f"[verify] serving {root} on http://{bind}:{port}/ (Ctrl-C or closing ssh stops it)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

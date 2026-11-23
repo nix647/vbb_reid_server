@@ -348,3 +348,46 @@ def test_the_check_page_links_the_list_and_has_no_disagreement_section(list_serv
     base, _, _ = list_server
     page = _req(f"{base}/")[1].decode()
     assert "Disagreements decided" not in page and "href='/fix'" in page
+
+
+def test_a_page_on_an_office_address_answers_to_that_address_and_loopback_only(tmp_path):
+    root, night = _night(tmp_path)  # owner 2026-11-23: colleagues open the page at the box's office address
+    from http.server import ThreadingHTTPServer
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(Store(root, fetch=lambda u: b"JPEG"),
+                                                               bind="192.168.0.107"))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        office = {"Host": f"192.168.0.107:{httpd.server_address[1]}"}
+        assert _req(base + "/", headers=office)[0] == 200
+        assert _req(base + "/", headers={"Host": "localhost"})[0] == 200  # a tunnel to that address still works
+        assert _post(base, night, {"answers": {"0": "H1"}},
+                     headers={"Content-Type": "application/json", "X-Review": "1"} | office)[0] == 200
+        for host in ("evil.example", "192.168.0.108", "192.168.0.1070"):  # DNS rebinding, or another machine
+            assert _req(base + "/", headers={"Host": host})[0] == 403, host
+            assert _post(base, night, {"answers": {"0": "H1"}},
+                         headers={"Content-Type": "application/json", "X-Review": "1", "Host": host})[0] == 403, host
+    finally:
+        httpd.shutdown()
+
+
+def test_a_page_on_loopback_still_refuses_the_office_address(server):
+    base, night, _, _ = server  # the default stays loopback-only: nothing opens unless asked for
+    assert _req(base + "/", headers={"Host": "192.168.0.107"})[0] == 403
+
+
+def test_a_page_never_listens_on_every_address(tmp_path):
+    root, _ = _night(tmp_path)  # the box's VPN and VM links would see it: name the one office address
+    for bind in ("0.0.0.0", "", "::"):
+        with pytest.raises(ValueError, match="one address"):
+            make_handler(Store(root), bind=bind)
+
+
+def test_verify_serve_passes_the_bind_address(tmp_path, monkeypatch):
+    import vbb_reid_server.verify as V
+    from vbb_reid_server.cli import main
+    calls = []
+    monkeypatch.setattr(V, "serve", lambda root, port, **k: calls.append((root, port, k)))
+    main(["verify-serve", "--root", str(tmp_path), "--port", "8771", "--bind", "192.168.0.107"])
+    main(["verify-serve", "--root", str(tmp_path)])
+    assert calls == [(tmp_path, 8771, {"bind": "192.168.0.107"}), (tmp_path, 8770, {"bind": "127.0.0.1"})]

@@ -471,7 +471,7 @@ def cmd_corrections(args) -> None:
 
 def cmd_verify_serve(args) -> None:
     from .verify import serve
-    serve(Path(args.root), args.port)
+    serve(Path(args.root), args.port, bind=args.bind)
 
 
 def cmd_quality_report(args) -> None:
@@ -782,6 +782,8 @@ def build_parser() -> argparse.ArgumentParser:
                                              "127.0.0.1, for an ssh tunnel")
     sp.add_argument("--root", required=True, help="verification root")
     sp.add_argument("--port", type=int, default=8770)
+    sp.add_argument("--bind", default="127.0.0.1", help="the address to listen on: 127.0.0.1 (ssh tunnel), or the box's "
+                    "office address for anyone on that network, with no login (owner 2026-11-23)")
     sp.set_defaults(fn=cmd_verify_serve)
 
     sp = sub.add_parser("doctor")

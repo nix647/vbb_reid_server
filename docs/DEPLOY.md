@@ -146,6 +146,8 @@ ssh -L 8770:127.0.0.1:8770 dosomi@192.168.0.107 \
 
 Then open `http://localhost:8770/`. If ssh exits with an error, or the page doesn't load, nothing is served. The page lists the nights. A night shows one picture at a time beside reference pictures of each person, and asks who it is. The machine's name, scores and picture links never reach the page. After "I'm done", the list shows that night's result, totals by face and body and by person, with the 97.5 % lower bound, and the wrong names with their pictures.
 
+For colleagues on the office network (owner 2026-11-23), start the server on the box with `--bind 192.168.0.107` (the box's office address), and anyone on that network opens `http://192.168.0.107:8770/` with no tunnel. There is **no login**: anyone there who has the address sees the pictures and can answer or remove reference pictures. The server listens on that one address only, never on the box's VPN or VM links (`0.0.0.0` is refused), so `localhost` links stop working; away from the office network, tunnel to it with `-L 8770:192.168.0.107:8770`. Two people must not answer the same night at once: each save replaces that night's answers with that page's copy.
+
 Reference pictures (`refs.json`) are built once, and again when the roster changes. They come only from answers the owner gave one picture at a time and blind, never from bulk labels. Each must show exactly one face, agree with its human label if it has one, and not be on the exclude list:
 
 ```bash
